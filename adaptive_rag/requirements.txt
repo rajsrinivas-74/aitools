@@ -1,0 +1,21 @@
+# Core LangChain and LLM dependencies
+langchain>=0.0.280,<1.0
+langchain-openai>=0.0.9,<1.0
+openai>=0.27.0,<1.0
+
+# Web UI framework
+streamlit>=1.25.0,<2.0
+
+# Environment configuration
+python-dotenv>=1.0.0,<2.0
+
+# Vector search and embeddings
+numpy>=1.24.0,<2.0
+faiss-cpu>=1.7.0,<2.0
+
+# Knowledge graph and RAG
+neo4j>=5.0.0,<6.0
+graphiti>=0.1.0,<1.0
+
+# Web search integration
+tavily-python>=0.1.0,<1.0
