@@ -9,7 +9,7 @@ import logging
 from typing import Dict, List, Any, Optional
 
 from app_config import get_config
-from rag_utils import generate_response, generate_response_from_contexts, BaseRetriever, ContextBlock
+from rag_utils import generate_response_from_contexts, BaseRetriever, ContextBlock
 
 logger = logging.getLogger(__name__)
 
@@ -179,12 +179,13 @@ class WebSearchRetriever(BaseRetriever):
                 "error": str(e)
             }
 
-    def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def retrieve(self, query: str, top_k: int = 5, docs: List[str] = None) -> List[Dict[str, Any]]:
         """Retrieve documents using web search (BaseRetriever interface).
         
         Args:
             query: Search query
             top_k: Number of results to retrieve
+            docs: Optional list of paths to documents (ignored for web search - searches live web)
             
         Returns:
             List of search results with id, title, url, content, and score
@@ -214,17 +215,18 @@ class WebSearchRetriever(BaseRetriever):
             logger.error(f"Web search retrieval failed: {e}")
             return []
     
-    def get_context_blocks(self, query: str, top_k: int = 5) -> List[ContextBlock]:
+    def get_context_blocks(self, query: str, top_k: int = 5, docs: List[str] = None) -> List[ContextBlock]:
         """Retrieve context blocks from web search.
         
         Args:
             query: Search query
             top_k: Number of results to retrieve
+            docs: Optional list of paths to documents (ignored for web search)
             
         Returns:
             List of ContextBlock objects
         """
-        documents = self.retrieve(query, top_k=top_k)
+        documents = self.retrieve(query, top_k=top_k, docs=docs)
         context_blocks = []
         
         for doc in documents:
@@ -244,39 +246,26 @@ class WebSearchRetriever(BaseRetriever):
         
         return context_blocks
 
-    def generate_response(self, query: str, max_results: int = 5, llm_model: str = "gpt-3.5-turbo") -> dict:
+    def generate_response(self, query: str) -> str:
         """Perform web search and generate LLM response in one call.
         
         Args:
             query: The user's question
-            max_results: Maximum web results to retrieve
-            llm_model: LLM model to use
             
         Returns:
-            Dictionary with:
-            - response: LLM-generated answer
-            - sources_used: List of sources (web_search)
-            - context_count: Number of results used
-            - search_results: List of raw search results
+            LLM-generated answer as a string
         """
         # Perform web search
-        retrieval_result = self.retrieve(query, max_results=max_results)
+        retrieval_result = self.retrieve(query, top_k=5)
         
-        if retrieval_result["error"]:
-            logger.error(f"Web search error: {retrieval_result['error']}")
-            return {
-                "response": f"Web search failed: {retrieval_result['error']}",
-                "sources_used": [],
-                "context_count": 0,
-                "search_results": [],
-                "error": retrieval_result["error"]
-            }
+        if not retrieval_result:
+            logger.error(f"Web search returned no results")
+            return "No web search results available for response generation."
         
         # Format context blocks from search results
-        search_results = retrieval_result["results"]
         context_blocks = []
         
-        for i, result in enumerate(search_results):
+        for i, result in enumerate(retrieval_result):
             content = f"Title: {result.get('title', '')}\nURL: {result.get('url', '')}\nContent: {result.get('content', '')}"
             context_blocks.append({
                 "content": content,
@@ -291,15 +280,17 @@ class WebSearchRetriever(BaseRetriever):
             })
         
         # Generate response using common function
-        response_data = generate_response_from_contexts(
-            question=query,
-            context_blocks=context_blocks,
-            llm_model=llm_model,
-            include_source_attribution=True
-        )
-        
-        response_data["search_results"] = search_results
-        return response_data
+        try:
+            response = generate_response_from_contexts(
+                question=query,
+                context_blocks=context_blocks,
+                llm_model="gpt-3.5-turbo",
+                include_source_attribution=True
+            )
+            return response
+        except Exception as e:
+            logger.error(f"WebSearchRetriever generate_response failed: {e}")
+            return f"Error generating response: {str(e)}"
 
 
 class WebSearchLLMPipeline:

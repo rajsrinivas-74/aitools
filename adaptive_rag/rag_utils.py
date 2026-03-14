@@ -31,6 +31,141 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
+# Error Types (Structured Error Handling)
+# ============================================================================
+
+class RAGError(Exception):
+    """Base exception for RAG system errors"""
+    def __init__(self, message: str, error_code: str = None, context: Dict[str, Any] = None):
+        self.message = message
+        self.error_code = error_code or "UNKNOWN_ERROR"
+        self.context = context or {}
+        super().__init__(self.message)
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert error to dictionary for logging/API responses"""
+        return {
+            "error": self.__class__.__name__,
+            "error_code": self.error_code,
+            "message": self.message,
+            "context": self.context
+        }
+
+
+class ValidationError(RAGError):
+    """Validation error for invalid inputs"""
+    pass
+
+
+class ConfigurationError(RAGError):
+    """Configuration error"""
+    pass
+
+
+class RetrieverError(RAGError):
+    """Retriever operation error"""
+    pass
+
+
+class LLMError(RAGError):
+    """LLM operation error"""
+    pass
+
+
+# ============================================================================
+# Input Validation
+# ============================================================================
+
+def validate_query(query: str, min_length: int = 1, max_length: int = 10000) -> str:
+    """Validate and normalize user query.
+    
+    Args:
+        query: User query string
+        min_length: Minimum query length
+        max_length: Maximum query length
+        
+    Returns:
+        Validated query string
+        
+    Raises:
+        ValidationError: If query is invalid
+    """
+    if not isinstance(query, str):
+        raise ValidationError(
+            f"Query must be string, got {type(query).__name__}",
+            error_code="INVALID_QUERY_TYPE"
+        )
+    
+    query = query.strip()
+    
+    if len(query) < min_length:
+        raise ValidationError(
+            f"Query too short (min {min_length} chars)",
+            error_code="QUERY_TOO_SHORT",
+            context={"length": len(query), "min_length": min_length}
+        )
+    
+    if len(query) > max_length:
+        raise ValidationError(
+            f"Query too long (max {max_length} chars)",
+            error_code="QUERY_TOO_LONG",
+            context={"length": len(query), "max_length": max_length}
+        )
+    
+    return query
+
+
+# ============================================================================
+# Base Classes for Legacy Compatibility
+# ============================================================================
+
+class RAGIndexer(ABC):
+    """Abstract base class for RAG indexers (legacy - for backward compatibility).
+    
+    VectorSearchIndexer and KnowledgeGraphIndexer inherit from this.
+    Provides common initialization patterns for LLM and environment loading.
+    """
+    
+    def __init__(self, llm_model: str = "gpt-3.5-turbo", env_file: str = None):
+        """Initialize RAG indexer.
+        
+        Args:
+            llm_model: LLM model to use for answering
+            env_file: Path to .env file
+        """
+        self.env_vars = load_env_file(env_file)
+        self.llm_model = llm_model or os.getenv("LLM_MODEL", "gpt-3.5-turbo")
+        self._validate_dependencies()
+    
+    @abstractmethod
+    def _validate_dependencies(self):
+        """Validate required dependencies. Implemented by subclasses."""
+        pass
+    
+    def index_document(self, path: str, chunk_size: int = 500, overlap: int = 100):
+        """Index a document.
+        
+        Args:
+            path: Path to document file
+            chunk_size: Size of chunks
+            overlap: Overlap between chunks
+        """
+        raise NotImplementedError("Subclasses must implement index_document()")
+    
+    def query_index(self, question: str, k: int = 4):
+        """Query the index.
+        
+        Args:
+            question: Question to ask
+            k: Number of results to return
+            
+        Returns:
+            List of results
+        """
+        raise NotImplementedError("Subclasses must implement query_index()")
+
+
+# ============================================================================
 # Text Processing Utilities
 # ============================================================================
 

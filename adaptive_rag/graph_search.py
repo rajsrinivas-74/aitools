@@ -18,7 +18,7 @@ import argparse
 import logging
 from typing import List, Tuple, Dict, Any
 
-from rag_utils import RAGIndexer, chunk_text, log_calls, load_env_file, generate_response, generate_response_from_contexts, BaseRetriever, ContextBlock
+from rag_utils import RAGIndexer, chunk_text, log_calls, load_env_file, generate_response_from_contexts, BaseRetriever, ContextBlock
 
 try:
     from neo4j import GraphDatabase
@@ -332,17 +332,31 @@ class GraphRetriever(BaseRetriever):
             logger.warning(f"GraphRetriever initialization failed: {e}")
             self.indexer = None
 
-    def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def retrieve(self, query: str, top_k: int = 5, docs: List[str] = None) -> List[Dict[str, Any]]:
         """Retrieve documents using graph-based entity search.
         
         Args:
             query: Search query
             top_k: Number of results to retrieve
+            docs: Optional list of paths to text documents to index before retrieval
             
         Returns:
             List of retrieved documents with content and entity match scores
         """
         logger.info(f"GraphRetriever: retrieving top {top_k} documents for query: {query}")
+        
+        # If docs parameter is provided, index all of them
+        if docs:
+            for doc_path in docs:
+                if not os.path.exists(doc_path):
+                    logger.error(f"Document file not found: {doc_path}")
+                    continue
+                try:
+                    logger.info(f"Indexing document: {doc_path}")
+                    self.indexer.index_document(doc_path)
+                except Exception as e:
+                    logger.error(f"Failed to index document {doc_path}: {e}")
+                    continue
         
         if not self.indexer:
             logger.warning("GraphRetriever: Neo4j connection not initialized. Returning empty results.")
@@ -371,17 +385,18 @@ class GraphRetriever(BaseRetriever):
             if self.indexer:
                 self.indexer.close()
     
-    def get_context_blocks(self, query: str, top_k: int = 5) -> List[ContextBlock]:
+    def get_context_blocks(self, query: str, top_k: int = 5, docs: List[str] = None) -> List[ContextBlock]:
         """Retrieve context blocks from graph search.
         
         Args:
             query: Search query
             top_k: Number of results to retrieve
+            docs: Optional list of paths to text documents to index before retrieval
             
         Returns:
             List of ContextBlock objects
         """
-        documents = self.retrieve(query, top_k=top_k)
+        documents = self.retrieve(query, top_k=top_k, docs=docs)
         context_blocks = []
         
         for doc in documents:
@@ -397,6 +412,34 @@ class GraphRetriever(BaseRetriever):
             context_blocks.append(block)
         
         return context_blocks
+
+    def generate_response(self, query: str) -> str:
+        """Generate a response for the query using graph-based retrieval.
+        
+        Args:
+            query: User query
+            
+        Returns:
+            Generated response string
+        """
+        if not self.indexer:
+            return "No knowledge graph available for response generation."
+        
+        try:
+            # Retrieve context blocks
+            context_blocks = self.get_context_blocks(query, top_k=5)
+            
+            # Generate response from contexts
+            response = generate_response_from_contexts(
+                question=query,
+                context_blocks=context_blocks,
+                llm_model="gpt-3.5-turbo",
+                include_source_attribution=True
+            )
+            return response
+        except Exception as e:
+            logger.error(f"GraphRetriever generate_response failed: {e}")
+            return f"Error generating response: {str(e)}"
 
 
 

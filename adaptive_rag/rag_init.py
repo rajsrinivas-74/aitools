@@ -8,7 +8,7 @@ centralized configuration and dependency injection.
 from app_config import get_config
 from enhance_prompt import PromptEnhancer
 from query_analysis import QueryAnalyzer
-from query_orchestrator import QueryOrchestrator
+from adaptive_rag import QueryOrchestrator
 
 
 def initialize_rag_system():
