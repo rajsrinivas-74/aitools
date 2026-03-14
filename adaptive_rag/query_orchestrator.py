@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 from app_config import get_config
 from enhance_prompt import PromptEnhancer
 from query_analysis import QueryAnalyzer
-from rag_utils import BaseRetriever, ContextBlock
+from rag_utils import BaseRetriever, ContextBlock, generate_response_from_contexts
 from vector_search import VectorRetriever
 from graph_search import GraphRetriever
 from web_search_retriever import WebSearchRetriever
@@ -33,20 +33,15 @@ logger = logging.getLogger(__name__)
 STRATEGY_VECTOR_SEARCH = "vector search"
 STRATEGY_GRAPH_SEARCH = "graph retrieval"
 STRATEGY_WEB_SEARCH = "web search"
-STRATEGY_HYBRID_SEARCH = "hybrid search"
-STRATEGY_SQL_SEARCH = "sql retrieval"
-STRATEGY_MULTI_STEP = "multi-step retrieval"
 
 # Default primary strategies for multi-retriever mode
 DEFAULT_MULTI_STRATEGIES = [STRATEGY_VECTOR_SEARCH, STRATEGY_GRAPH_SEARCH, STRATEGY_WEB_SEARCH]
 
+# Fallback strategy map for single-retriever mode
 FALLBACK_MAP = {
-    STRATEGY_VECTOR_SEARCH: STRATEGY_HYBRID_SEARCH,
-    STRATEGY_HYBRID_SEARCH: STRATEGY_WEB_SEARCH,
-    STRATEGY_GRAPH_SEARCH: STRATEGY_HYBRID_SEARCH,
-    STRATEGY_SQL_SEARCH: STRATEGY_HYBRID_SEARCH,
-    STRATEGY_WEB_SEARCH: STRATEGY_HYBRID_SEARCH,
-    STRATEGY_MULTI_STEP: STRATEGY_WEB_SEARCH,
+    STRATEGY_VECTOR_SEARCH: STRATEGY_WEB_SEARCH,
+    STRATEGY_GRAPH_SEARCH: STRATEGY_VECTOR_SEARCH,
+    STRATEGY_WEB_SEARCH: STRATEGY_VECTOR_SEARCH,
 }
 
 
@@ -117,136 +112,6 @@ class AggregatedContext:
         }
 
 
-# ============================================================================
-# Mock Retrievers (for testing/fallback)
-# ============================================================================
-
-class MockRetrieverBase(BaseRetriever):
-    """Base class for mock retrievers used in testing/fallback."""
-    
-    def _create_mock_documents(self, query: str, source: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """Create mock documents for testing."""
-        return [
-            {
-                "id": f"{source}_doc_{i}",
-                "content": f"{source.title()} document {i} for '{query}'",
-                "score": 0.90 - i*0.08,
-                "source": source
-            }
-            for i in range(top_k)
-        ]
-    
-    def _documents_to_context_blocks(self, documents: List[Dict[str, Any]], 
-                                      retrieval_method: str) -> List[ContextBlock]:
-        """Convert documents to context blocks."""
-        context_blocks = []
-        for doc in documents:
-            block = ContextBlock(
-                content=doc.get("content", ""),
-                source=doc.get("source", "unknown"),
-                score=doc.get("score", 0.0),
-                metadata={
-                    "doc_id": doc.get("id", ""),
-                    "retrieval_method": retrieval_method
-                }
-            )
-            context_blocks.append(block)
-        return context_blocks
-
-
-class HybridRetriever(MockRetrieverBase):
-    """Hybrid search combining vector and keyword-based retrieval (mock implementation)."""
-
-    def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        logger.info(f"HybridRetriever: retrieving top {top_k} documents for query: {query}")
-        return self._create_mock_documents(query, "hybrid", top_k)
-    
-    def get_context_blocks(self, query: str, top_k: int = 5) -> List[ContextBlock]:
-        """Retrieve context blocks from hybrid search."""
-        documents = self.retrieve(query, top_k=top_k)
-        return self._documents_to_context_blocks(documents, "hybrid_vector_keyword")
-
-
-class SQLRetriever(MockRetrieverBase):
-    """SQL-based retrieval from structured databases (mock implementation)."""
-
-    def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        logger.info(f"SQLRetriever: querying structured database for: {query}")
-        return self._create_mock_documents(query, "sql", top_k)
-    
-    def get_context_blocks(self, query: str, top_k: int = 5) -> List[ContextBlock]:
-        """Retrieve context blocks from SQL database."""
-        documents = self.retrieve(query, top_k=top_k)
-        return self._documents_to_context_blocks(documents, "structured_query")
-
-
-class LLMGenerator:
-    """LLM-based answer generation from retrieved context."""
-
-    def __init__(self, llm=None):
-        """
-        Initialize LLMGenerator with optional injected LLM.
-
-        Args:
-            llm: Optional pre-initialized LLM instance for generation (higher temperature).
-                 If None, creates one from app_config.
-        """
-        if llm is None:
-            self.llm = config.get_llm_generator(temperature=0.7)
-        else:
-            self.llm = llm
-
-    def generate(self, query: str, context: List[str]) -> str:
-        """Generate an answer using LLM given query and context documents."""
-        if not self.llm:
-            return "Error: LLM not initialized."
-
-        context_text = "\n\n".join(context) if context else "No context available."
-        system_prompt = (
-            "You are a helpful assistant. Use the provided context to answer the user's question. "
-            "If the information is not in the context, say so clearly."
-        )
-        user_prompt = f"Context:\n{context_text}\n\nQuestion: {query}\n\nAnswer:"
-
-        try:
-            resp = self.llm.invoke(user_prompt)
-            return getattr(resp, "content", str(resp))
-        except Exception as e:
-            logger.error(f"LLM generation failed: {e}")
-            return f"Error generating answer: {e}"
-    
-    def generate_from_aggregated_context(self, query: str, aggregated_context: AggregatedContext) -> str:
-        """Generate an answer using aggregated context from multiple sources.
-        
-        Args:
-            query: The user's question
-            aggregated_context: AggregatedContext object with blocks from multiple retrievers
-            
-        Returns:
-            LLM-generated answer
-        """
-        if not self.llm:
-            return "Error: LLM not initialized."
-        
-        # Format context with source attribution
-        formatted_context = aggregated_context.get_formatted_context(include_sources=True)
-        
-        system_prompt = (
-            "You are a helpful assistant. Use the provided context from multiple sources to answer the user's question. "
-            "Each context block is prefixed with its source (e.g., VECTOR_SEARCH, GRAPH_SEARCH, WEB_SEARCH). "
-            "Synthesize information from all available sources. If information conflicts, note the discrepancy. "
-            "If the information is not in the context, say so clearly."
-        )
-        user_prompt = f"Context from multiple sources:\n{formatted_context}\n\nQuestion: {query}\n\nAnswer:"
-
-        try:
-            resp = self.llm.invoke(user_prompt)
-            return getattr(resp, "content", str(resp))
-        except Exception as e:
-            logger.error(f"LLM generation from aggregated context failed: {e}")
-            return f"Error generating answer: {e}"
-
-
 class QueryOrchestrator:
     """
     Orchestrates the Adaptive RAG pipeline.
@@ -259,7 +124,7 @@ class QueryOrchestrator:
     # (Populated in __init__)
 
     def __init__(self, llm=None, prompt_enhancer=None, query_analyzer=None, 
-                 llm_generator=None, confidence_threshold: float = None, 
+                 confidence_threshold: float = None, 
                  min_docs_threshold: int = None, tavily_api_key: str = None,
                  vector_index_path: str = "faiss_index", neo4j_uri: str = None,
                  neo4j_user: str = None, neo4j_password: str = None, env_file: str = None):
@@ -270,7 +135,6 @@ class QueryOrchestrator:
             llm: Optional pre-initialized LLM instance
             prompt_enhancer: Optional pre-initialized PromptEnhancer instance
             query_analyzer: Optional pre-initialized QueryAnalyzer instance
-            llm_generator: Optional pre-initialized LLMGenerator instance
             confidence_threshold: Confidence threshold (uses config default if None)
             min_docs_threshold: Min docs threshold (uses config default if None)
             tavily_api_key: Optional Tavily API key for web search retriever
@@ -284,7 +148,6 @@ class QueryOrchestrator:
         self.llm = llm or config.get_llm()
         self.prompt_enhancer = prompt_enhancer or PromptEnhancer(llm=self.llm)
         self.query_analyzer = query_analyzer or QueryAnalyzer(llm=self.llm, prompt_enhancer=self.prompt_enhancer)
-        self.generator = llm_generator or LLMGenerator(llm=config.get_llm_generator(temperature=0.7))
         
         # Configuration
         self.confidence_threshold = confidence_threshold if confidence_threshold is not None else config.confidence_threshold
@@ -310,12 +173,7 @@ class QueryOrchestrator:
         # Web Search Retriever
         self.retrievers[STRATEGY_WEB_SEARCH] = WebSearchRetriever(tavily_api_key=tavily_api_key)
         
-        # Mock retrievers for testing/fallback
-        self.retrievers[STRATEGY_HYBRID_SEARCH] = HybridRetriever()
-        self.retrievers[STRATEGY_SQL_SEARCH] = SQLRetriever()
-        self.retrievers[STRATEGY_MULTI_STEP] = HybridRetriever()
-        
-        logger.info("QueryOrchestrator initialized with Vector Search and Graph Search indexers")
+        logger.info("QueryOrchestrator initialized with Vector, Graph, and Web Search indexers")
 
     def orchestrate(self, query: str, use_multiple_retrievers: bool = False) -> Dict[str, Any]:
         """
@@ -376,7 +234,7 @@ class QueryOrchestrator:
         logger.info(f"Query analysis complete: {json.dumps(query_analysis, indent=2)}")
 
         query_type = query_analysis.get("query_type", "")
-        strategy = query_analysis.get("recommended_retrieval_strategy", STRATEGY_HYBRID_SEARCH)
+        strategy = query_analysis.get("recommended_retrieval_strategy", STRATEGY_VECTOR_SEARCH)
         confidence = query_analysis.get("confidence_score", 0.5)
         rewrite_query = query_analysis.get("rewrite_query", "")
         sub_queries = query_analysis.get("sub_queries", [])
@@ -421,13 +279,20 @@ class QueryOrchestrator:
         fallback_used = False
         if len(documents) < self.min_docs_threshold:
             logger.warning(f"Insufficient documents retrieved ({len(documents)}). Triggering fallback.")
-            fallback_strategy = FALLBACK_MAP.get(strategy, STRATEGY_HYBRID_SEARCH)
+            fallback_strategy = FALLBACK_MAP.get(strategy, STRATEGY_VECTOR_SEARCH)
             documents = self._retrieve_with_strategy(query, fallback_strategy)
             fallback_used = True
+            strategy = fallback_strategy
         
-        # Generate answer
-        context = [doc.get("content", "") for doc in documents]
-        answer = self.generator.generate(analysis["retrieval_query"], context)
+        # Delegate generation to the retriever
+        try:
+            retriever = self.retrievers[strategy]
+            answer = retriever.generate_response(analysis["retrieval_query"])
+            if isinstance(answer, dict):
+                answer = answer.get("answer", str(answer))
+        except Exception as e:
+            logger.error(f"Generation failed: {e}")
+            answer = f"Error generating answer: {e}"
         
         return answer, None, documents, fallback_used, sub_queries_executed
     
@@ -442,7 +307,7 @@ class QueryOrchestrator:
             Tuple of (answer, aggregated_context, documents, fallback_used, sub_queries_executed)
         """
         aggregated_context, all_documents = self._execute_multi_retriever(query, strategies=DEFAULT_MULTI_STRATEGIES)
-        answer = self.generator.generate_from_aggregated_context(analysis["retrieval_query"], aggregated_context)
+        answer = self._synthesize_from_aggregated_context(analysis["retrieval_query"], aggregated_context)
         return answer, aggregated_context, all_documents, False, []
     
     def _execute_multi_retriever(self, query: str, strategies: List[str] = None, top_k: int = 5) -> Tuple[AggregatedContext, List[Dict[str, Any]]]:
@@ -498,6 +363,38 @@ class QueryOrchestrator:
         logger.info(f"Multi-retriever complete. Aggregated {len(aggregated_context.blocks)} context blocks from {len(aggregated_context.get_sources())} sources")
         return aggregated_context, all_documents
 
+    def _synthesize_from_aggregated_context(self, query: str, aggregated_context: AggregatedContext) -> str:
+        """Synthesize answer from aggregated context across multiple sources.
+        
+        This is the only place where the orchestrator performs LLM synthesis,
+        and only for multi-source aggregation where individual retrievers
+        cannot handle cross-source synthesis.
+        
+        Args:
+            query: The user's question
+            aggregated_context: AggregatedContext object with blocks from multiple sources
+            
+        Returns:
+            Synthesized answer
+        """
+        try:
+            # Format context with source attribution
+            context_list = [block.content for block in aggregated_context.blocks]
+            
+            if not context_list:
+                return "No context available to answer the question."
+            
+            # Use the utility function for synthesis
+            answer = generate_response_from_contexts(query, context_list, self.llm)
+            if isinstance(answer, dict):
+                answer = answer.get("answer", str(answer))
+            
+            logger.info(f"Multi-source synthesis complete for query: {query}")
+            return answer
+        except Exception as e:
+            logger.error(f"Multi-source synthesis failed: {e}")
+            return f"Error synthesizing answer from multiple sources: {e}"
+    
     def _select_retrieval_query(self, original_query: str, rewrite_query: str, confidence: float) -> str:
         """
         Select whether to use original or rewritten query based on confidence.
@@ -549,8 +446,8 @@ class QueryOrchestrator:
             List of retrieved documents
         """
         if strategy not in self.retrievers:
-            logger.warning(f"Unknown strategy '{strategy}'. Defaulting to {STRATEGY_HYBRID_SEARCH}.")
-            strategy = STRATEGY_HYBRID_SEARCH
+            logger.warning(f"Unknown strategy '{strategy}'. Defaulting to {STRATEGY_VECTOR_SEARCH}.")
+            strategy = STRATEGY_VECTOR_SEARCH
 
         retriever = self.retrievers[strategy]
         documents = retriever.retrieve(query, top_k=top_k)
@@ -594,14 +491,12 @@ def main():
     llm = config.get_llm()
     prompt_enhancer = PromptEnhancer(llm=llm)
     query_analyzer = QueryAnalyzer(llm=llm, prompt_enhancer=prompt_enhancer)
-    llm_generator = LLMGenerator(llm=config.get_llm_generator(temperature=0.7))
     
     # Initialize orchestrator with vector and graph search indexers
     orchestrator = QueryOrchestrator(
         llm=llm,
         prompt_enhancer=prompt_enhancer,
         query_analyzer=query_analyzer,
-        llm_generator=llm_generator,
         vector_index_path="faiss_index",
         neo4j_uri=None,  # Set from environment or config
         neo4j_user=None,
