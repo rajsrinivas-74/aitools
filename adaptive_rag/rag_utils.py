@@ -1,12 +1,19 @@
-"""Shared utilities for RAG systems.
+"""Shared utilities and base classes for RAG systems.
 
-Common functions and base classes for vector search and graph search RAG implementations.
+This module provides:
+- Common utility functions (text chunking, environment loading, logging)
+- Embedding model abstractions
+- Base classes and interfaces (ContextBlock, BaseRetriever)
+- LLM response generation utilities
+
+Each concern is clearly separated for better cohesion.
 """
 
 import os
 import logging
 from typing import List, Callable, Dict, Any
 from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
 
 try:
     from dotenv import load_dotenv, dotenv_values
@@ -24,51 +31,8 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
-# Utility Functions
+# Text Processing Utilities
 # ============================================================================
-
-def _short_repr(obj, maxlen: int = 200) -> str:
-    """Create a short representation of an object for logging.
-    
-    Args:
-        obj: Object to represent
-        maxlen: Maximum length of string representation
-        
-    Returns:
-        Short string representation
-    """
-    try:
-        if isinstance(obj, str):
-            return obj if len(obj) <= maxlen else obj[:maxlen] + "..."
-        if isinstance(obj, (list, tuple)):
-            return f"{type(obj).__name__}(len={len(obj)})"
-        return repr(obj)
-    except Exception:
-        return "<unrepresentable>"
-
-
-def log_calls(func: Callable) -> Callable:
-    """Decorator to log function entry, exit, and exceptions.
-    
-    Args:
-        func: Function to decorate
-        
-    Returns:
-        Wrapped function with logging
-    """
-    def wrapper(*args, **kwargs):
-        try:
-            logger.info("ENTER %s args=%s kwargs=%s", func.__name__, _short_repr(args), _short_repr(kwargs))
-            res = func(*args, **kwargs)
-            logger.info("EXIT %s -> %s", func.__name__, _short_repr(res))
-            return res
-        except Exception as e:
-            logger.exception("EXCEPTION in %s: %s", func.__name__, e)
-            raise
-    wrapper.__name__ = func.__name__
-    wrapper.__doc__ = func.__doc__
-    return wrapper
-
 
 def chunk_text(text: str, chunk_size: int = 500, overlap: int = 100) -> List[str]:
     """Chunk text into overlapping pieces.
@@ -123,256 +87,61 @@ def load_env_file(path: str = None) -> dict:
 
 
 # ============================================================================
-# Base Classes
+# Logging Utilities
 # ============================================================================
 
-class RAGIndexer(ABC):
-    """Abstract base class for RAG systems."""
+def _short_repr(obj, maxlen: int = 200) -> str:
+    """Create a short representation of an object for logging.
+    
+    Args:
+        obj: Object to represent
+        maxlen: Maximum length of string representation
+        
+    Returns:
+        Short string representation
+    """
+    try:
+        if isinstance(obj, str):
+            return obj if len(obj) <= maxlen else obj[:maxlen] + "..."
+        if isinstance(obj, (list, tuple)):
+            return f"{type(obj).__name__}(len={len(obj)})"
+        return repr(obj)
+    except Exception:
+        return "<unrepresentable>"
 
-    def __init__(self, llm_model: str = "gpt-3.5-turbo", env_file: str = None):
-        """Initialize RAG indexer.
-        
-        Args:
-            llm_model: LLM model to use for answering
-            env_file: Path to .env file
-        """
-        self.env_vars = load_env_file(env_file)
-        self.llm_model = llm_model or os.getenv("LLM_MODEL", "gpt-3.5-turbo")
-        self._validate_dependencies()
 
-    @abstractmethod
-    def _validate_dependencies(self):
-        """Validate required dependencies. Must be implemented by subclasses."""
-        pass
-
-    def index_document(self, path: str, chunk_size: int = 500, overlap: int = 100):
-        """Index a document.
+def log_calls(func: Callable) -> Callable:
+    """Decorator to log function entry, exit, and exceptions.
+    
+    Args:
+        func: Function to decorate
         
-        Args:
-            path: Path to document file
-            chunk_size: Size of chunks
-            overlap: Overlap between chunks
-        """
-        raise NotImplementedError("Subclasses must implement index_document()")
-
-    def query_index(self, question: str, k: int = 4):
-        """Query the index.
-        
-        Args:
-            question: Question to ask
-            k: Number of results to return
-            
-        Returns:
-            List of results
-        """
-        raise NotImplementedError("Subclasses must implement query_index()")
-
-    def answer_with_llm(self, question: str, contexts: List[str]) -> str:
-        """Generate an answer using LLM.
-        
-        Args:
-            question: The question
-            contexts: Context chunks
-            
-        Returns:
-            Generated answer
-        """
-        if openai is None:
-            raise RuntimeError("openai package is required (pip install openai)")
-        
-        system = (
-            "You are a helpful assistant. Use the provided context to answer the user's question. "
-            "If the answer is not contained in the context, say you do not know the answer. Be concise."
-        )
-        context_text = "\n\n---\n\n".join(contexts)
-        prompt = f"Context:\n{context_text}\n\nQuestion: {question}\n\nAnswer using only the context above."
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": prompt},
-        ]
-        
+    Returns:
+        Wrapped function with logging
+    """
+    def wrapper(*args, **kwargs):
         try:
-            resp = openai.chat.completions.create(
-                model=self.llm_model, 
-                messages=messages, 
-                temperature=0.0
-            )
-            return resp.choices[0].message.content.strip()
-        except AttributeError:
-            # Older OpenAI client API
-            resp = openai.ChatCompletion.create(
-                model=self.llm_model, 
-                messages=messages, 
-                temperature=0.0
-            )
-            return resp['choices'][0]['message']['content'].strip()
-
-    def close(self):
-        """Clean up resources. Override in subclasses if needed."""
-        pass
+            logger.debug("ENTER %s args=%s kwargs=%s", func.__name__, _short_repr(args), _short_repr(kwargs))
+            res = func(*args, **kwargs)
+            logger.debug("EXIT %s -> %s", func.__name__, _short_repr(res))
+            return res
+        except Exception as e:
+            logger.exception("EXCEPTION in %s: %s", func.__name__, e)
+            raise
+    wrapper.__name__ = func.__name__
+    wrapper.__doc__ = func.__doc__
+    return wrapper
 
 
 # ============================================================================
-# LLM Response Generation
+# Embedding Models
 # ============================================================================
-
-def generate_response(question: str, contexts: List[str], llm_model: str = "gpt-3.5-turbo",
-                     system_prompt: str = None, include_sources: bool = False) -> str:
-    """Generate an LLM response from a question and context blocks.
-    
-    This is a common utility function used by all RAG modules (vector search, graph search, web search).
-    
-    Args:
-        question: The user's question
-        contexts: List of context strings to use for answering
-        llm_model: LLM model to use (default: gpt-3.5-turbo)
-        system_prompt: Optional custom system prompt (uses default if None)
-        include_sources: If True and contexts have source info, include it in response
-        
-    Returns:
-        LLM-generated response
-        
-    Raises:
-        RuntimeError: If openai package is not installed
-        Exception: If LLM call fails
-    """
-    if openai is None:
-        raise RuntimeError("openai package is required (pip install openai)")
-    
-    if system_prompt is None:
-        system_prompt = (
-            "You are a helpful assistant. Use the provided context to answer the user's question. "
-            "If the answer is not contained in the context, say you do not know the answer. Be concise and direct."
-        )
-    
-    # Format context text
-    if not contexts:
-        context_text = "No context available."
-    elif include_sources:
-        # Format with source attribution if available
-        context_text = "\n\n---\n\n".join(contexts)
-    else:
-        # Simple concatenation
-        context_text = "\n\n---\n\n".join(contexts)
-    
-    # Build prompt
-    user_prompt = f"Context:\n{context_text}\n\nQuestion: {question}\n\nAnswer:"
-    
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-    
-    try:
-        resp = openai.chat.completions.create(
-            model=llm_model,
-            messages=messages,
-            temperature=0.0
-        )
-        return resp.choices[0].message.content.strip()
-    except AttributeError:
-        # Older OpenAI client API
-        resp = openai.ChatCompletion.create(
-            model=llm_model,
-            messages=messages,
-            temperature=0.0
-        )
-        return resp['choices'][0]['message']['content'].strip()
-
-
-def generate_response_from_contexts(question: str, context_blocks: List[dict], 
-                                      llm_model: str = "gpt-3.5-turbo",
-                                      include_source_attribution: bool = True) -> dict:
-    """Generate LLM response from structured context blocks.
-    
-    This function is designed to work with context blocks that have metadata like source and score.
-    
-    Args:
-        question: The user's question
-        context_blocks: List of context block dictionaries with keys:
-            - content (str): The context text
-            - source (str, optional): Where the context came from (e.g., "vector_search")
-            - score (float, optional): Relevance score
-            - metadata (dict, optional): Additional metadata
-        llm_model: LLM model to use
-        include_source_attribution: Whether to include source info in formatted context
-        
-    Returns:
-        Dictionary with:
-        - response: The LLM-generated response
-        - sources_used: List of unique sources in the context
-        - context_count: Number of context blocks used
-    """
-    if openai is None:
-        raise RuntimeError("openai package is required (pip install openai)")
-    
-    # Extract content and track sources
-    context_texts = []
-    sources_used = set()
-    
-    for block in context_blocks:
-        if isinstance(block, dict):
-            content = block.get("content", "")
-            source = block.get("source", "unknown")
-            score = block.get("score", 0.0)
-            
-            if include_source_attribution and source != "unknown":
-                formatted = f"[{source.upper()} - confidence: {score:.2f}]\n{content}"
-            else:
-                formatted = content
-            
-            context_texts.append(formatted)
-            sources_used.add(source)
-        else:
-            # Handle plain strings
-            context_texts.append(str(block))
-    
-    # Generate response
-    system_prompt = (
-        "You are a helpful assistant. Use the provided context from multiple sources to answer the user's question. "
-        "Synthesize information across all sources when relevant. "
-        "If the answer is not contained in the context, say you do not know the answer."
-    )
-    
-    context_text = "\n\n---\n\n".join(context_texts) if context_texts else "No context available."
-    user_prompt = f"Context from multiple sources:\n{context_text}\n\nQuestion: {question}\n\nAnswer:"
-    
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
-    ]
-    
-    try:
-        resp = openai.chat.completions.create(
-            model=llm_model,
-            messages=messages,
-            temperature=0.0
-        )
-        response_text = resp.choices[0].message.content.strip()
-    except AttributeError:
-        # Older OpenAI client API
-        resp = openai.ChatCompletion.create(
-            model=llm_model,
-            messages=messages,
-            temperature=0.0
-        )
-        response_text = resp['choices'][0]['message']['content'].strip()
-    
-    return {
-        "response": response_text,
-        "sources_used": list(sources_used),
-        "context_count": len(context_texts),
-        "context_blocks": context_blocks
-    }
-
-
-def close(self):
-        """Clean up resources. Override in subclasses if needed."""
-        pass
-
 
 class EmbeddingModel(ABC):
-    """Abstract base class for embedding models."""
+    """Abstract base class for embedding models.
+    
+    Provides interface for text embedding implementations.
+    """
 
     @abstractmethod
     def embed(self, text: str) -> List[float]:
@@ -400,14 +169,17 @@ class EmbeddingModel(ABC):
 
 
 class OpenAIEmbedding(EmbeddingModel):
-    """OpenAI embedding model wrapper."""
+    """OpenAI embedding model wrapper.
+    
+    Uses OpenAI's embedding API to generate text embeddings.
+    """
 
     def __init__(self, model: str = "text-embedding-3-small", api_key: str = None):
         """Initialize OpenAI embedding model.
         
         Args:
             model: OpenAI embedding model name
-            api_key: OpenAI API key
+            api_key: OpenAI API key (uses OPENAI_API_KEY env var if not provided)
         """
         self.model = model
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
@@ -428,7 +200,7 @@ class OpenAIEmbedding(EmbeddingModel):
             response = openai.embeddings.create(input=text, model=self.model)
             return response.data[0].embedding
         except AttributeError:
-            # Older API
+            # Older OpenAI API
             response = openai.Embedding.create(input=text, model=self.model)
             return response['data'][0]['embedding']
 
@@ -448,28 +220,33 @@ class OpenAIEmbedding(EmbeddingModel):
             response = openai.embeddings.create(input=texts, model=self.model)
             return [item.embedding for item in response.data]
         except AttributeError:
-            # Older API
+            # Older OpenAI API
             response = openai.Embedding.create(input=texts, model=self.model)
             return [item['embedding'] for item in response['data']]
 
 
 # ============================================================================
-# Base Retriever Interface
+# Data Structures (Context/Results)
 # ============================================================================
-
-from dataclasses import dataclass, field
-
 
 @dataclass
 class ContextBlock:
-    """Represents a single block of retrieved context with metadata."""
+    """Represents a single block of retrieved context with metadata.
+    
+    Used across all retrievers to provide structured context with
+    source attribution and confidence scores.
+    """
     content: str
     source: str  # e.g., "vector_search", "graph_search", "web_search"
     score: float  # Relevance or confidence score
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary format."""
+        """Convert to dictionary format.
+        
+        Returns:
+            Dictionary representation of the context block
+        """
         return {
             "content": self.content,
             "source": self.source,
@@ -478,8 +255,16 @@ class ContextBlock:
         }
 
 
+# ============================================================================
+# Base Retriever Interface
+# ============================================================================
+
 class BaseRetriever(ABC):
-    """Abstract base class for all retriever implementations."""
+    """Abstract base class for all retriever implementations.
+    
+    Defines the interface that all concrete retrievers (vector, graph, web)
+    must implement. Enables polymorphism and decoupling from implementations.
+    """
 
     @abstractmethod
     def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
@@ -490,7 +275,7 @@ class BaseRetriever(ABC):
             top_k: Number of results to retrieve
             
         Returns:
-            List of retrieved documents
+            List of retrieved documents with metadata
         """
         pass
     
@@ -503,7 +288,108 @@ class BaseRetriever(ABC):
             top_k: Number of results to retrieve
             
         Returns:
-            List of ContextBlock objects
+            List of ContextBlock objects with source and score information
         """
         pass
 
+    @abstractmethod
+    def generate_response(self, query: str) -> str:
+        """Generate a response for the query using this retriever's sources.
+        
+        Combines retrieval and LLM generation in a single step.
+        
+        Args:
+            query: User query
+            
+        Returns:
+            Generated response string
+        """
+        pass
+
+
+# ============================================================================
+# LLM Response Generation
+# ============================================================================
+
+def generate_response_from_contexts(question: str, context_blocks: List, 
+                                    llm_model: str = "gpt-3.5-turbo",
+                                    include_source_attribution: bool = True) -> str:
+    """Generate LLM response from context blocks.
+    
+    This utility is used by multiple sources (including multi-source aggregation
+    in the orchestrator) to synthesize responses from retrieved context.
+    
+    Args:
+        question: The user's question
+        context_blocks: List of context strings or ContextBlock objects
+        llm_model: LLM model to use
+        include_source_attribution: Whether to include source info in formatted context
+        
+    Returns:
+        LLM-generated response string
+        
+    Raises:
+        RuntimeError: If openai package is not installed
+    """
+    if openai is None:
+        raise RuntimeError("openai package is required (pip install openai)")
+    
+    # Extract content from various formats
+    context_texts = []
+    sources_used = set()
+    
+    for block in context_blocks:
+        if isinstance(block, ContextBlock):
+            content = block.content
+            source = block.source
+            score = block.score
+            if include_source_attribution:
+                formatted = f"[{source.upper()} - confidence: {score:.2f}]\n{content}"
+            else:
+                formatted = content
+            context_texts.append(formatted)
+            sources_used.add(source)
+        elif isinstance(block, dict):
+            content = block.get("content", "")
+            source = block.get("source", "unknown")
+            score = block.get("score", 0.0)
+            if include_source_attribution and source != "unknown":
+                formatted = f"[{source.upper()} - confidence: {score:.2f}]\n{content}"
+            else:
+                formatted = content
+            context_texts.append(formatted)
+            sources_used.add(source)
+        else:
+            # Handle plain strings
+            context_texts.append(str(block))
+    
+    # Generate response
+    system_prompt = (
+        "You are a helpful assistant. Use the provided context to answer the user's question. "
+        "If the answer is not contained in the context, say you do not know the answer. "
+        "Be concise and direct."
+    )
+    
+    context_text = "\n\n---\n\n".join(context_texts) if context_texts else "No context available."
+    user_prompt = f"Context:\n{context_text}\n\nQuestion: {question}\n\nAnswer:"
+    
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
+    ]
+    
+    try:
+        resp = openai.chat.completions.create(
+            model=llm_model,
+            messages=messages,
+            temperature=0.0
+        )
+        return resp.choices[0].message.content.strip()
+    except AttributeError:
+        # Older OpenAI client API
+        resp = openai.ChatCompletion.create(
+            model=llm_model,
+            messages=messages,
+            temperature=0.0
+        )
+        return resp['choices'][0]['message']['content'].strip()

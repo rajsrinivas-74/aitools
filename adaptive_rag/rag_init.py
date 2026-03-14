@@ -8,7 +8,7 @@ centralized configuration and dependency injection.
 from app_config import get_config
 from enhance_prompt import PromptEnhancer
 from query_analysis import QueryAnalyzer
-from query_orchestrator import QueryOrchestrator, LLMGenerator
+from query_orchestrator import QueryOrchestrator
 
 
 def initialize_rag_system():
@@ -36,10 +36,6 @@ def initialize_rag_system():
     llm = config.get_llm()
     print(f"✓ LLM initialized: {config.model}")
     
-    # Initialize generation LLM (higher temperature for creativity)
-    llm_gen = config.get_llm_generator(temperature=0.7)
-    print(f"✓ Generation LLM initialized")
-    
     # Initialize components with shared LLM instance
     prompt_enhancer = PromptEnhancer(llm=llm)
     print(f"✓ PromptEnhancer initialized")
@@ -47,15 +43,12 @@ def initialize_rag_system():
     query_analyzer = QueryAnalyzer(llm=llm, prompt_enhancer=prompt_enhancer)
     print(f"✓ QueryAnalyzer initialized")
     
-    llm_generator = LLMGenerator(llm=llm_gen)
-    print(f"✓ LLMGenerator initialized")
-    
-    # Initialize orchestrator with all injected dependencies
+    # Initialize orchestrator with injected dependencies
+    # Note: LLMGenerator was removed - generation is now delegated to individual retrievers
     orchestrator = QueryOrchestrator(
         llm=llm,
         prompt_enhancer=prompt_enhancer,
-        query_analyzer=query_analyzer,
-        llm_generator=llm_generator
+        query_analyzer=query_analyzer
     )
     print(f"✓ QueryOrchestrator initialized")
     
@@ -63,10 +56,8 @@ def initialize_rag_system():
     return {
         "config": config,
         "llm": llm,
-        "llm_gen": llm_gen,
         "prompt_enhancer": prompt_enhancer,
         "query_analyzer": query_analyzer,
-        "llm_generator": llm_generator,
         "orchestrator": orchestrator,
     }
 
