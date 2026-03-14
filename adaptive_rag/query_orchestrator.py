@@ -27,6 +27,30 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================================
+# Strategy Constants
+# ============================================================================
+
+STRATEGY_VECTOR_SEARCH = "vector search"
+STRATEGY_GRAPH_SEARCH = "graph retrieval"
+STRATEGY_WEB_SEARCH = "web search"
+STRATEGY_HYBRID_SEARCH = "hybrid search"
+STRATEGY_SQL_SEARCH = "sql retrieval"
+STRATEGY_MULTI_STEP = "multi-step retrieval"
+
+# Default primary strategies for multi-retriever mode
+DEFAULT_MULTI_STRATEGIES = [STRATEGY_VECTOR_SEARCH, STRATEGY_GRAPH_SEARCH, STRATEGY_WEB_SEARCH]
+
+FALLBACK_MAP = {
+    STRATEGY_VECTOR_SEARCH: STRATEGY_HYBRID_SEARCH,
+    STRATEGY_HYBRID_SEARCH: STRATEGY_WEB_SEARCH,
+    STRATEGY_GRAPH_SEARCH: STRATEGY_HYBRID_SEARCH,
+    STRATEGY_SQL_SEARCH: STRATEGY_HYBRID_SEARCH,
+    STRATEGY_WEB_SEARCH: STRATEGY_HYBRID_SEARCH,
+    STRATEGY_MULTI_STEP: STRATEGY_WEB_SEARCH,
+}
+
+
+# ============================================================================
 # Context Structures
 # ============================================================================
 
@@ -97,66 +121,63 @@ class AggregatedContext:
 # Mock Retrievers (for testing/fallback)
 # ============================================================================
 
-class HybridRetriever(BaseRetriever):
-    """Hybrid search combining vector and keyword-based retrieval."""
+class MockRetrieverBase(BaseRetriever):
+    """Base class for mock retrievers used in testing/fallback."""
+    
+    def _create_mock_documents(self, query: str, source: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """Create mock documents for testing."""
+        return [
+            {
+                "id": f"{source}_doc_{i}",
+                "content": f"{source.title()} document {i} for '{query}'",
+                "score": 0.90 - i*0.08,
+                "source": source
+            }
+            for i in range(top_k)
+        ]
+    
+    def _documents_to_context_blocks(self, documents: List[Dict[str, Any]], 
+                                      retrieval_method: str) -> List[ContextBlock]:
+        """Convert documents to context blocks."""
+        context_blocks = []
+        for doc in documents:
+            block = ContextBlock(
+                content=doc.get("content", ""),
+                source=doc.get("source", "unknown"),
+                score=doc.get("score", 0.0),
+                metadata={
+                    "doc_id": doc.get("id", ""),
+                    "retrieval_method": retrieval_method
+                }
+            )
+            context_blocks.append(block)
+        return context_blocks
+
+
+class HybridRetriever(MockRetrieverBase):
+    """Hybrid search combining vector and keyword-based retrieval (mock implementation)."""
 
     def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         logger.info(f"HybridRetriever: retrieving top {top_k} documents for query: {query}")
-        # Mock implementation - combine vector and BM25 retrieval
-        return [
-            {"id": f"hybrid_doc_{i}", "content": f"Hybrid document {i} for '{query}'", "score": 0.90 - i*0.08, "source": "hybrid_search"}
-            for i in range(top_k)
-        ]
+        return self._create_mock_documents(query, "hybrid", top_k)
     
     def get_context_blocks(self, query: str, top_k: int = 5) -> List[ContextBlock]:
         """Retrieve context blocks from hybrid search."""
         documents = self.retrieve(query, top_k=top_k)
-        context_blocks = []
-        
-        for doc in documents:
-            block = ContextBlock(
-                content=doc.get("content", ""),
-                source="hybrid_search",
-                score=doc.get("score", 0.0),
-                metadata={
-                    "doc_id": doc.get("id", ""),
-                    "retrieval_method": "hybrid_vector_keyword"
-                }
-            )
-            context_blocks.append(block)
-        
-        return context_blocks
+        return self._documents_to_context_blocks(documents, "hybrid_vector_keyword")
 
 
-class SQLRetriever(BaseRetriever):
-    """SQL-based retrieval from structured databases."""
+class SQLRetriever(MockRetrieverBase):
+    """SQL-based retrieval from structured databases (mock implementation)."""
 
     def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
         logger.info(f"SQLRetriever: querying structured database for: {query}")
-        # Mock implementation - replace with actual SQL queries
-        return [
-            {"id": f"sql_doc_{i}", "content": f"SQL result {i} for '{query}'", "score": 0.88 - i*0.07, "source": "sql_search"}
-            for i in range(top_k)
-        ]
+        return self._create_mock_documents(query, "sql", top_k)
     
     def get_context_blocks(self, query: str, top_k: int = 5) -> List[ContextBlock]:
         """Retrieve context blocks from SQL database."""
         documents = self.retrieve(query, top_k=top_k)
-        context_blocks = []
-        
-        for doc in documents:
-            block = ContextBlock(
-                content=doc.get("content", ""),
-                source="sql_search",
-                score=doc.get("score", 0.0),
-                metadata={
-                    "doc_id": doc.get("id", ""),
-                    "retrieval_method": "structured_query"
-                }
-            )
-            context_blocks.append(block)
-        
-        return context_blocks
+        return self._documents_to_context_blocks(documents, "structured_query")
 
 
 class LLMGenerator:
@@ -234,15 +255,8 @@ class QueryOrchestrator:
     manages fallback strategies, and integrates with LLM generation.
     """
 
-    # Mapping of strategy names to retriever classes
-    RETRIEVER_MAP = {
-        "vector search": VectorRetriever,
-        "hybrid search": HybridRetriever,
-        "graph retrieval": GraphRetriever,
-        "sql retrieval": SQLRetriever,
-        "web search": WebSearchRetriever,
-        "multi-step retrieval": HybridRetriever,  # Default to hybrid for multi-step
-    }
+    # Mapping of strategy names to pre-initialized retrievers
+    # (Populated in __init__)
 
     def __init__(self, llm=None, prompt_enhancer=None, query_analyzer=None, 
                  llm_generator=None, confidence_threshold: float = None, 
@@ -280,13 +294,13 @@ class QueryOrchestrator:
         self.retrievers: Dict[str, BaseRetriever] = {}
         
         # Vector Search Retriever
-        self.retrievers["vector search"] = VectorRetriever(
+        self.retrievers[STRATEGY_VECTOR_SEARCH] = VectorRetriever(
             index_path=vector_index_path,
             env_file=env_file
         )
         
         # Graph Search Retriever
-        self.retrievers["graph retrieval"] = GraphRetriever(
+        self.retrievers[STRATEGY_GRAPH_SEARCH] = GraphRetriever(
             neo4j_uri=neo4j_uri,
             neo4j_user=neo4j_user,
             neo4j_password=neo4j_password,
@@ -294,12 +308,12 @@ class QueryOrchestrator:
         )
         
         # Web Search Retriever
-        self.retrievers["web search"] = WebSearchRetriever(tavily_api_key=tavily_api_key)
+        self.retrievers[STRATEGY_WEB_SEARCH] = WebSearchRetriever(tavily_api_key=tavily_api_key)
         
-        # Hybrid and SQL retrievers use defaults
-        self.retrievers["hybrid search"] = HybridRetriever()
-        self.retrievers["sql retrieval"] = SQLRetriever()
-        self.retrievers["multi-step retrieval"] = HybridRetriever()
+        # Mock retrievers for testing/fallback
+        self.retrievers[STRATEGY_HYBRID_SEARCH] = HybridRetriever()
+        self.retrievers[STRATEGY_SQL_SEARCH] = SQLRetriever()
+        self.retrievers[STRATEGY_MULTI_STEP] = HybridRetriever()
         
         logger.info("QueryOrchestrator initialized with Vector Search and Graph Search indexers")
 
@@ -315,53 +329,20 @@ class QueryOrchestrator:
             Final response with answer and metadata
         """
         # Step 1: Analyze the query
-        logger.info(f"Analyzing query: {query}")
-        query_analysis = self.query_analyzer.analyze(query)
-        logger.info(f"Query analysis complete: {json.dumps(query_analysis, indent=2)}")
-
-        # Extract analysis results
-        query_type = query_analysis.get("query_type", "")
-        strategy = query_analysis.get("recommended_retrieval_strategy", "hybrid search")
-        confidence = query_analysis.get("confidence_score", 0.5)
-        rewrite_query = query_analysis.get("rewrite_query", "")
-        sub_queries = query_analysis.get("sub_queries", [])
-
-        logger.info(f"Orchestrating query: {query} | Type: {query_type} | Strategy: {strategy}")
-
-        # Handle query rewriting
-        retrieval_query = self._select_retrieval_query(query, rewrite_query, confidence)
-
-        # Execute retrieval - either single strategy or multiple
+        query_analysis = self._analyze_and_route_query(query)
+        
+        # Step 2: Determine retrieval path and execute
+        retrieval_query = query_analysis["retrieval_query"]
+        strategy = query_analysis["strategy"]
+        
         if use_multiple_retrievers:
-            # Aggregate context from multiple sources
-            aggregated_context, all_documents = self._execute_multi_retriever(retrieval_query)
-            fallback_used = False
-            answer = self.generator.generate_from_aggregated_context(query, aggregated_context)
-            sub_queries_executed = []
+            result = self._execute_multi_retriever_path(retrieval_query, query_analysis)
         else:
-            # Original single-strategy approach
-            if query_type == "multi-hop" and sub_queries:
-                documents = self._execute_multi_hop_retrieval(sub_queries, strategy)
-                sub_queries_executed = sub_queries
-            else:
-                documents = self._execute_retrieval(retrieval_query, strategy)
-                sub_queries_executed = []
-
-            # Handle fallback if insufficient documents
-            fallback_used = False
-            if len(documents) < self.min_docs_threshold:
-                logger.warning(f"Insufficient documents retrieved ({len(documents)}). Triggering fallback.")
-                fallback_strategy = self._get_fallback_strategy(strategy)
-                documents = self._execute_retrieval(retrieval_query, fallback_strategy)
-                fallback_used = True
-
-            # Generate answer using LLM
-            context = [doc.get("content", "") for doc in documents]
-            answer = self.generator.generate(query, context)
-            all_documents = documents
-            aggregated_context = None
-
-        # Compile response
+            result = self._execute_single_retriever_path(retrieval_query, strategy, query_analysis)
+        
+        # Step 3: Compile final response
+        answer, aggregated_context, all_documents, fallback_used, sub_queries_executed = result
+        
         response = {
             "query": query,
             "retrieval_strategy": strategy,
@@ -372,14 +353,97 @@ class QueryOrchestrator:
                 "fallback_used": fallback_used,
                 "sub_queries_executed": sub_queries_executed,
                 "documents_count": len(all_documents) if all_documents else 0,
-                "confidence_score": confidence,
-                "query_type": query_type,
+                "confidence_score": query_analysis["confidence"],
+                "query_type": query_analysis["query_type"],
                 "multi_retriever_used": use_multiple_retrievers,
             }
         }
 
         logger.info(f"Orchestration complete. Retrieved {len(all_documents) if all_documents else 0} documents.")
         return response
+    
+    def _analyze_and_route_query(self, query: str) -> Dict[str, Any]:
+        """Analyze query and determine routing strategy.
+        
+        Args:
+            query: User query
+            
+        Returns:
+            Dictionary with analysis results and routing info
+        """
+        logger.info(f"Analyzing query: {query}")
+        query_analysis = self.query_analyzer.analyze(query)
+        logger.info(f"Query analysis complete: {json.dumps(query_analysis, indent=2)}")
+
+        query_type = query_analysis.get("query_type", "")
+        strategy = query_analysis.get("recommended_retrieval_strategy", STRATEGY_HYBRID_SEARCH)
+        confidence = query_analysis.get("confidence_score", 0.5)
+        rewrite_query = query_analysis.get("rewrite_query", "")
+        sub_queries = query_analysis.get("sub_queries", [])
+
+        logger.info(f"Orchestrating query: {query} | Type: {query_type} | Strategy: {strategy}")
+
+        # Select final retrieval query based on confidence
+        retrieval_query = self._select_retrieval_query(query, rewrite_query, confidence)
+        
+        return {
+            "query_type": query_type,
+            "strategy": strategy,
+            "confidence": confidence,
+            "retrieval_query": retrieval_query,
+            "sub_queries": sub_queries,
+        }
+    
+    def _execute_single_retriever_path(self, query: str, strategy: str, 
+                                      analysis: Dict[str, Any]) -> Tuple[str, Optional[AggregatedContext], List[Dict[str, Any]], bool, List[str]]:
+        """Execute single-retriever path with fallback support.
+        
+        Args:
+            query: Query to retrieve for
+            strategy: Primary retrieval strategy
+            analysis: Query analysis results
+            
+        Returns:
+            Tuple of (answer, aggregated_context, documents, fallback_used, sub_queries_executed)
+        """
+        query_type = analysis["query_type"]
+        sub_queries = analysis["sub_queries"]
+        
+        # Execute retrieval
+        if query_type == "multi-hop" and sub_queries:
+            documents = self._execute_multi_hop_retrieval(sub_queries, strategy)
+            sub_queries_executed = sub_queries
+        else:
+            documents = self._retrieve_with_strategy(query, strategy)
+            sub_queries_executed = []
+        
+        # Handle fallback if insufficient documents
+        fallback_used = False
+        if len(documents) < self.min_docs_threshold:
+            logger.warning(f"Insufficient documents retrieved ({len(documents)}). Triggering fallback.")
+            fallback_strategy = FALLBACK_MAP.get(strategy, STRATEGY_HYBRID_SEARCH)
+            documents = self._retrieve_with_strategy(query, fallback_strategy)
+            fallback_used = True
+        
+        # Generate answer
+        context = [doc.get("content", "") for doc in documents]
+        answer = self.generator.generate(analysis["retrieval_query"], context)
+        
+        return answer, None, documents, fallback_used, sub_queries_executed
+    
+    def _execute_multi_retriever_path(self, query: str, analysis: Dict[str, Any]) -> Tuple[str, AggregatedContext, List[Dict[str, Any]], bool, List[str]]:
+        """Execute multi-retriever path with context aggregation.
+        
+        Args:
+            query: Query to retrieve for
+            analysis: Query analysis results
+            
+        Returns:
+            Tuple of (answer, aggregated_context, documents, fallback_used, sub_queries_executed)
+        """
+        aggregated_context, all_documents = self._execute_multi_retriever(query, strategies=DEFAULT_MULTI_STRATEGIES)
+        answer = self.generator.generate_from_aggregated_context(analysis["retrieval_query"], aggregated_context)
+        return answer, aggregated_context, all_documents, False, []
     
     def _execute_multi_retriever(self, query: str, strategies: List[str] = None, top_k: int = 5) -> Tuple[AggregatedContext, List[Dict[str, Any]]]:
         """Execute multiple retrievers and aggregate context.
@@ -393,8 +457,7 @@ class QueryOrchestrator:
             Tuple of (AggregatedContext, list of documents)
         """
         if strategies is None:
-            # Use primary strategies by default
-            strategies = ["vector search", "graph retrieval", "web search"]
+            strategies = DEFAULT_MULTI_STRATEGIES
         
         aggregated_context = AggregatedContext()
         all_documents = []
@@ -409,14 +472,18 @@ class QueryOrchestrator:
             
             try:
                 retriever = self.retrievers[strategy]
-                
-                # Get context blocks from the retriever
+                # Get context blocks - this is the primary interface
                 context_blocks = retriever.get_context_blocks(query, top_k=top_k)
                 aggregated_context.add_blocks(context_blocks)
                 
-                # Also get documents for backward compatibility
-                documents = retriever.retrieve(query, top_k=top_k)
-                for doc in documents:
+                # Extract documents from context blocks for backward compatibility
+                for block in context_blocks:
+                    doc = {
+                        "id": block.metadata.get("doc_id", f"{strategy}_{len(all_documents)}"),
+                        "content": block.content,
+                        "score": block.score,
+                        "source": block.source
+                    }
                     doc_id = doc.get("id")
                     if doc_id not in seen_ids:
                         all_documents.append(doc)
@@ -469,9 +536,9 @@ class QueryOrchestrator:
         logger.info(f"Confidence sufficient ({confidence:.2f}). Using original query.")
         return original_query
 
-    def _execute_retrieval(self, query: str, strategy: str, top_k: int = 5) -> List[Dict[str, Any]]:
+    def _retrieve_with_strategy(self, query: str, strategy: str, top_k: int = 5) -> List[Dict[str, Any]]:
         """
-        Execute retrieval using the specified strategy.
+        Execute retrieval using pre-initialized retriever for the specified strategy.
 
         Args:
             query: Query to retrieve for
@@ -481,12 +548,11 @@ class QueryOrchestrator:
         Returns:
             List of retrieved documents
         """
-        retriever_class = self.RETRIEVER_MAP.get(strategy.lower())
-        if not retriever_class:
-            logger.warning(f"Unknown strategy '{strategy}'. Defaulting to hybrid search.")
-            retriever_class = HybridRetriever
+        if strategy not in self.retrievers:
+            logger.warning(f"Unknown strategy '{strategy}'. Defaulting to {STRATEGY_HYBRID_SEARCH}.")
+            strategy = STRATEGY_HYBRID_SEARCH
 
-        retriever = retriever_class()
+        retriever = self.retrievers[strategy]
         documents = retriever.retrieve(query, top_k=top_k)
         logger.info(f"Retrieved {len(documents)} documents using {strategy}")
         return documents
@@ -509,7 +575,7 @@ class QueryOrchestrator:
 
         for i, sub_query in enumerate(sub_queries, 1):
             logger.info(f"Executing sub-query {i}/{len(sub_queries)}: {sub_query}")
-            docs = self._execute_retrieval(sub_query, strategy, top_k=top_k)
+            docs = self._retrieve_with_strategy(sub_query, strategy, top_k=top_k)
             for doc in docs:
                 doc_id = doc.get("id")
                 if doc_id not in seen_ids:
@@ -519,26 +585,7 @@ class QueryOrchestrator:
         logger.info(f"Multi-hop retrieval complete. Aggregated {len(all_documents)} unique documents.")
         return all_documents
 
-    @staticmethod
-    def _get_fallback_strategy(primary_strategy: str) -> str:
-        """
-        Determine fallback strategy based on primary strategy.
 
-        Args:
-            primary_strategy: Primary retrieval strategy
-
-        Returns:
-            Fallback strategy name
-        """
-        fallback_map = {
-            "vector search": "hybrid search",
-            "hybrid search": "web search",
-            "graph retrieval": "hybrid search",
-            "sql retrieval": "hybrid search",
-            "web search": "hybrid search",
-            "multi-step retrieval": "web search",
-        }
-        return fallback_map.get(primary_strategy.lower(), "hybrid search")
 
 
 def main():
