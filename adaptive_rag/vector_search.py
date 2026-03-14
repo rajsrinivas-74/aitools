@@ -17,10 +17,11 @@ import os
 import argparse
 import logging
 import pickle
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 
 from rag_utils import (
-    RAGIndexer, OpenAIEmbedding, chunk_text, log_calls, load_env_file, generate_response, generate_response_from_contexts
+    RAGIndexer, OpenAIEmbedding, chunk_text, log_calls, load_env_file, generate_response, generate_response_from_contexts,
+    BaseRetriever, ContextBlock
 )
 
 try:
@@ -274,6 +275,93 @@ class VectorSearchIndexer(RAGIndexer):
         return response_data
 
 
+# ============================================================================
+# Retriever Interface for Orchestrator
+# ============================================================================
+
+class VectorRetriever(BaseRetriever):
+    """Vector similarity-based retrieval using FAISS and OpenAI embeddings."""
+
+    def __init__(self, index_path: str = "faiss_index", env_file: str = None):
+        """
+        Initialize VectorRetriever with FAISS index.
+
+        Args:
+            index_path: Path to FAISS index files
+            env_file: Optional path to .env file
+        """
+        try:
+            self.indexer = VectorSearchIndexer(
+                index_path=index_path,
+                env_file=env_file
+            )
+            logger.info("VectorRetriever initialized with FAISS index")
+        except Exception as e:
+            logger.warning(f"VectorRetriever initialization failed: {e}")
+            self.indexer = None
+
+    def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """Retrieve documents using vector similarity search.
+        
+        Args:
+            query: Search query
+            top_k: Number of results to retrieve
+            
+        Returns:
+            List of retrieved documents with content and similarity scores
+        """
+        logger.info(f"VectorRetriever: retrieving top {top_k} documents for query: {query}")
+        
+        if not self.indexer or self.indexer.index_store.is_empty():
+            logger.warning("VectorRetriever: No index available. Returning empty results.")
+            return []
+        
+        try:
+            results = self.indexer.query_index(query, k=top_k)
+            
+            # Format results to match BaseRetriever interface
+            formatted_results = []
+            for i, (content, score) in enumerate(results):
+                formatted_results.append({
+                    "id": f"vector_doc_{i}",
+                    "content": content,
+                    "score": float(score),
+                    "source": "vector_search"
+                })
+            
+            logger.info(f"VectorRetriever: Retrieved {len(formatted_results)} documents")
+            return formatted_results
+            
+        except Exception as e:
+            logger.error(f"VectorRetriever retrieval failed: {e}")
+            return []
+    
+    def get_context_blocks(self, query: str, top_k: int = 5) -> List[ContextBlock]:
+        """Retrieve context blocks from vector search.
+        
+        Args:
+            query: Search query
+            top_k: Number of results to retrieve
+            
+        Returns:
+            List of ContextBlock objects
+        """
+        documents = self.retrieve(query, top_k=top_k)
+        context_blocks = []
+        
+        for doc in documents:
+            block = ContextBlock(
+                content=doc.get("content", ""),
+                source="vector_search",
+                score=doc.get("score", 0.0),
+                metadata={
+                    "doc_id": doc.get("id", ""),
+                    "retrieval_method": "semantic_similarity"
+                }
+            )
+            context_blocks.append(block)
+        
+        return context_blocks
 
 
 

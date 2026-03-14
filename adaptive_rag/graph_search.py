@@ -16,9 +16,9 @@ Environment variables:
 import os
 import argparse
 import logging
-from typing import List, Tuple
+from typing import List, Tuple, Dict, Any
 
-from rag_utils import RAGIndexer, chunk_text, log_calls, load_env_file, generate_response, generate_response_from_contexts
+from rag_utils import RAGIndexer, chunk_text, log_calls, load_env_file, generate_response, generate_response_from_contexts, BaseRetriever, ContextBlock
 
 try:
     from neo4j import GraphDatabase
@@ -302,6 +302,101 @@ class KnowledgeGraphIndexer(RAGIndexer):
         self.db_connection.close()
 
 
+# ============================================================================
+# Retriever Interface for Orchestrator
+# ============================================================================
+
+class GraphRetriever(BaseRetriever):
+    """Graph-based retrieval using entity relationships and Neo4j."""
+
+    def __init__(self, neo4j_uri: str = None, neo4j_user: str = None, 
+                 neo4j_password: str = None, env_file: str = None):
+        """
+        Initialize GraphRetriever with Neo4j connection.
+
+        Args:
+            neo4j_uri: Neo4j connection URI
+            neo4j_user: Neo4j username
+            neo4j_password: Neo4j password
+            env_file: Optional path to .env file
+        """
+        try:
+            self.indexer = KnowledgeGraphIndexer(
+                neo4j_uri=neo4j_uri,
+                neo4j_user=neo4j_user,
+                neo4j_password=neo4j_password,
+                env_file=env_file
+            )
+            logger.info("GraphRetriever initialized with Neo4j connection")
+        except Exception as e:
+            logger.warning(f"GraphRetriever initialization failed: {e}")
+            self.indexer = None
+
+    def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """Retrieve documents using graph-based entity search.
+        
+        Args:
+            query: Search query
+            top_k: Number of results to retrieve
+            
+        Returns:
+            List of retrieved documents with content and entity match scores
+        """
+        logger.info(f"GraphRetriever: retrieving top {top_k} documents for query: {query}")
+        
+        if not self.indexer:
+            logger.warning("GraphRetriever: Neo4j connection not initialized. Returning empty results.")
+            return []
+        
+        try:
+            results = self.indexer.query_index(query, k=top_k)
+            
+            # Format results to match BaseRetriever interface
+            formatted_results = []
+            for i, (content, score) in enumerate(results):
+                formatted_results.append({
+                    "id": f"graph_doc_{i}",
+                    "content": content,
+                    "score": float(score),
+                    "source": "graph_search"
+                })
+            
+            logger.info(f"GraphRetriever: Retrieved {len(formatted_results)} documents")
+            return formatted_results
+            
+        except Exception as e:
+            logger.error(f"GraphRetriever retrieval failed: {e}")
+            return []
+        finally:
+            if self.indexer:
+                self.indexer.close()
+    
+    def get_context_blocks(self, query: str, top_k: int = 5) -> List[ContextBlock]:
+        """Retrieve context blocks from graph search.
+        
+        Args:
+            query: Search query
+            top_k: Number of results to retrieve
+            
+        Returns:
+            List of ContextBlock objects
+        """
+        documents = self.retrieve(query, top_k=top_k)
+        context_blocks = []
+        
+        for doc in documents:
+            block = ContextBlock(
+                content=doc.get("content", ""),
+                source="graph_search",
+                score=doc.get("score", 0.0),
+                metadata={
+                    "doc_id": doc.get("id", ""),
+                    "retrieval_method": "entity_relationship_matching"
+                }
+            )
+            context_blocks.append(block)
+        
+        return context_blocks
 
 
 

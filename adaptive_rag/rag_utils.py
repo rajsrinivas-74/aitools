@@ -5,7 +5,7 @@ Common functions and base classes for vector search and graph search RAG impleme
 
 import os
 import logging
-from typing import List, Callable
+from typing import List, Callable, Dict, Any
 from abc import ABC, abstractmethod
 
 try:
@@ -451,3 +451,59 @@ class OpenAIEmbedding(EmbeddingModel):
             # Older API
             response = openai.Embedding.create(input=texts, model=self.model)
             return [item['embedding'] for item in response['data']]
+
+
+# ============================================================================
+# Base Retriever Interface
+# ============================================================================
+
+from dataclasses import dataclass, field
+
+
+@dataclass
+class ContextBlock:
+    """Represents a single block of retrieved context with metadata."""
+    content: str
+    source: str  # e.g., "vector_search", "graph_search", "web_search"
+    score: float  # Relevance or confidence score
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary format."""
+        return {
+            "content": self.content,
+            "source": self.source,
+            "score": self.score,
+            "metadata": self.metadata
+        }
+
+
+class BaseRetriever(ABC):
+    """Abstract base class for all retriever implementations."""
+
+    @abstractmethod
+    def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """Retrieve documents matching the query.
+        
+        Args:
+            query: Search query
+            top_k: Number of results to retrieve
+            
+        Returns:
+            List of retrieved documents
+        """
+        pass
+    
+    @abstractmethod
+    def get_context_blocks(self, query: str, top_k: int = 5) -> List[ContextBlock]:
+        """Retrieve context blocks with metadata.
+        
+        Args:
+            query: Search query
+            top_k: Number of results to retrieve
+            
+        Returns:
+            List of ContextBlock objects
+        """
+        pass
+

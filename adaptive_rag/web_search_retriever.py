@@ -9,7 +9,7 @@ import logging
 from typing import Dict, List, Any, Optional
 
 from app_config import get_config
-from rag_utils import generate_response, generate_response_from_contexts
+from rag_utils import generate_response, generate_response_from_contexts, BaseRetriever, ContextBlock
 
 logger = logging.getLogger(__name__)
 
@@ -127,11 +127,11 @@ class TavilySearch:
         return formatted
 
 
-class WebSearchRetriever:
+class WebSearchRetriever(BaseRetriever):
     """
     Retrieves information from the web using Tavily search.
     
-    Integrates web search into the Adaptive RAG pipeline.
+    Implements BaseRetriever interface for integration with Adaptive RAG Orchestrator.
     """
 
     def __init__(self, tavily_api_key: str = None):
@@ -144,9 +144,9 @@ class WebSearchRetriever:
         self.search_engine = TavilySearch(api_key=tavily_api_key)
         logger.info("WebSearchRetriever initialized")
 
-    def retrieve(self, query: str, max_results: int = 5) -> Dict[str, Any]:
+    def _retrieve_internal(self, query: str, max_results: int = 5) -> Dict[str, Any]:
         """
-        Retrieve web search results for a query.
+        Internal retrieval method (legacy interface). Returns raw search results dict.
 
         Args:
             query: Search query
@@ -178,6 +178,71 @@ class WebSearchRetriever:
                 "context": "",
                 "error": str(e)
             }
+
+    def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """Retrieve documents using web search (BaseRetriever interface).
+        
+        Args:
+            query: Search query
+            top_k: Number of results to retrieve
+            
+        Returns:
+            List of search results with id, title, url, content, and score
+        """
+        logger.info(f"WebSearchRetriever: searching web for: {query}")
+        
+        try:
+            # Perform Tavily search
+            results = self.search_engine.search(query, max_results=top_k, search_depth="advanced")
+            
+            # Format results to match BaseRetriever interface
+            formatted_results = []
+            for i, result in enumerate(results):
+                formatted_results.append({
+                    "id": i,
+                    "title": result.get("title", ""),
+                    "url": result.get("url", ""),
+                    "content": result.get("content", ""),
+                    "score": 1.0 - (i * 0.1),  # Ranking score
+                    "source": "web_search"
+                })
+            
+            logger.info(f"Retrieved {len(formatted_results)} web search results")
+            return formatted_results
+            
+        except Exception as e:
+            logger.error(f"Web search retrieval failed: {e}")
+            return []
+    
+    def get_context_blocks(self, query: str, top_k: int = 5) -> List[ContextBlock]:
+        """Retrieve context blocks from web search.
+        
+        Args:
+            query: Search query
+            top_k: Number of results to retrieve
+            
+        Returns:
+            List of ContextBlock objects
+        """
+        documents = self.retrieve(query, top_k=top_k)
+        context_blocks = []
+        
+        for doc in documents:
+            content = f"{doc.get('title', '')}\nURL: {doc.get('url', '')}\n{doc.get('content', '')}"
+            block = ContextBlock(
+                content=content,
+                source="web_search",
+                score=doc.get("score", 0.0),
+                metadata={
+                    "doc_id": doc.get("id", ""),
+                    "title": doc.get("title", ""),
+                    "url": doc.get("url", ""),
+                    "retrieval_method": "web_search"
+                }
+            )
+            context_blocks.append(block)
+        
+        return context_blocks
 
     def generate_response(self, query: str, max_results: int = 5, llm_model: str = "gpt-3.5-turbo") -> dict:
         """Perform web search and generate LLM response in one call.

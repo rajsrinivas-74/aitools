@@ -17,9 +17,10 @@ from dataclasses import dataclass, field
 from app_config import get_config
 from enhance_prompt import PromptEnhancer
 from query_analysis import QueryAnalyzer
-from web_search_retriever import TavilySearch
-from vector_search import VectorSearchIndexer
-from graph_search import KnowledgeGraphIndexer
+from rag_utils import BaseRetriever, ContextBlock
+from vector_search import VectorRetriever
+from graph_search import GraphRetriever
+from web_search_retriever import WebSearchRetriever
 
 config = get_config()
 logger = logging.getLogger(__name__)
@@ -28,24 +29,6 @@ logger = logging.getLogger(__name__)
 # ============================================================================
 # Context Structures
 # ============================================================================
-
-@dataclass
-class ContextBlock:
-    """Represents a single block of retrieved context with metadata."""
-    content: str
-    source: str  # e.g., "vector_search", "graph_search", "web_search"
-    score: float  # Relevance or confidence score
-    metadata: Dict[str, Any] = field(default_factory=dict)
-
-    def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary format."""
-        return {
-            "content": self.content,
-            "source": self.source,
-            "score": self.score,
-            "metadata": self.metadata
-        }
-
 
 @dataclass
 class AggregatedContext:
@@ -111,115 +94,8 @@ class AggregatedContext:
 
 
 # ============================================================================
-# Base Retriever
+# Mock Retrievers (for testing/fallback)
 # ============================================================================
-
-class BaseRetriever(ABC):
-    """Abstract base class for all retriever implementations."""
-
-    @abstractmethod
-    def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """Retrieve documents matching the query."""
-        pass
-    
-    @abstractmethod
-    def get_context_blocks(self, query: str, top_k: int = 5) -> List[ContextBlock]:
-        """Retrieve context blocks with metadata.
-        
-        Args:
-            query: Search query
-            top_k: Number of results to retrieve
-            
-        Returns:
-            List of ContextBlock objects
-        """
-        pass
-
-
-class VectorRetriever(BaseRetriever):
-    """Vector similarity-based retrieval using FAISS and OpenAI embeddings."""
-
-    def __init__(self, index_path: str = "faiss_index", env_file: str = None):
-        """
-        Initialize VectorRetriever with FAISS index.
-
-        Args:
-            index_path: Path to FAISS index files
-            env_file: Optional path to .env file
-        """
-        try:
-            self.indexer = VectorSearchIndexer(
-                index_path=index_path,
-                env_file=env_file
-            )
-            logger.info("VectorRetriever initialized with FAISS index")
-        except Exception as e:
-            logger.warning(f"VectorRetriever initialization failed: {e}")
-            self.indexer = None
-
-    def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """Retrieve documents using vector similarity search.
-        
-        Args:
-            query: Search query
-            top_k: Number of results to retrieve
-            
-        Returns:
-            List of retrieved documents with content and similarity scores
-        """
-        logger.info(f"VectorRetriever: retrieving top {top_k} documents for query: {query}")
-        
-        if not self.indexer or self.indexer.index_store.is_empty():
-            logger.warning("VectorRetriever: No index available. Returning empty results.")
-            return []
-        
-        try:
-            results = self.indexer.query_index(query, k=top_k)
-            
-            # Format results to match BaseRetriever interface
-            formatted_results = []
-            for i, (content, score) in enumerate(results):
-                formatted_results.append({
-                    "id": f"vector_doc_{i}",
-                    "content": content,
-                    "score": float(score),
-                    "source": "vector_search"
-                })
-            
-            logger.info(f"VectorRetriever: Retrieved {len(formatted_results)} documents")
-            return formatted_results
-            
-        except Exception as e:
-            logger.error(f"VectorRetriever retrieval failed: {e}")
-            return []
-    
-    def get_context_blocks(self, query: str, top_k: int = 5) -> List[ContextBlock]:
-        """Retrieve context blocks from vector search.
-        
-        Args:
-            query: Search query
-            top_k: Number of results to retrieve
-            
-        Returns:
-            List of ContextBlock objects
-        """
-        documents = self.retrieve(query, top_k=top_k)
-        context_blocks = []
-        
-        for doc in documents:
-            block = ContextBlock(
-                content=doc.get("content", ""),
-                source="vector_search",
-                score=doc.get("score", 0.0),
-                metadata={
-                    "doc_id": doc.get("id", ""),
-                    "retrieval_method": "semantic_similarity"
-                }
-            )
-            context_blocks.append(block)
-        
-        return context_blocks
-
 
 class HybridRetriever(BaseRetriever):
     """Hybrid search combining vector and keyword-based retrieval."""
@@ -252,99 +128,6 @@ class HybridRetriever(BaseRetriever):
         return context_blocks
 
 
-class GraphRetriever(BaseRetriever):
-    """Graph-based retrieval using entity relationships and Neo4j."""
-
-    def __init__(self, neo4j_uri: str = None, neo4j_user: str = None, 
-                 neo4j_password: str = None, env_file: str = None):
-        """
-        Initialize GraphRetriever with Neo4j connection.
-
-        Args:
-            neo4j_uri: Neo4j connection URI
-            neo4j_user: Neo4j username
-            neo4j_password: Neo4j password
-            env_file: Optional path to .env file
-        """
-        try:
-            self.indexer = KnowledgeGraphIndexer(
-                neo4j_uri=neo4j_uri,
-                neo4j_user=neo4j_user,
-                neo4j_password=neo4j_password,
-                env_file=env_file
-            )
-            logger.info("GraphRetriever initialized with Neo4j connection")
-        except Exception as e:
-            logger.warning(f"GraphRetriever initialization failed: {e}")
-            self.indexer = None
-
-    def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """Retrieve documents using graph-based entity search.
-        
-        Args:
-            query: Search query
-            top_k: Number of results to retrieve
-            
-        Returns:
-            List of retrieved documents with content and entity match scores
-        """
-        logger.info(f"GraphRetriever: retrieving top {top_k} documents for query: {query}")
-        
-        if not self.indexer:
-            logger.warning("GraphRetriever: Neo4j connection not initialized. Returning empty results.")
-            return []
-        
-        try:
-            results = self.indexer.query_index(query, k=top_k)
-            
-            # Format results to match BaseRetriever interface
-            formatted_results = []
-            for i, (content, score) in enumerate(results):
-                formatted_results.append({
-                    "id": f"graph_doc_{i}",
-                    "content": content,
-                    "score": float(score),
-                    "source": "graph_search"
-                })
-            
-            logger.info(f"GraphRetriever: Retrieved {len(formatted_results)} documents")
-            return formatted_results
-            
-        except Exception as e:
-            logger.error(f"GraphRetriever retrieval failed: {e}")
-            return []
-        finally:
-            if self.indexer:
-                self.indexer.close()
-    
-    def get_context_blocks(self, query: str, top_k: int = 5) -> List[ContextBlock]:
-        """Retrieve context blocks from graph search.
-        
-        Args:
-            query: Search query
-            top_k: Number of results to retrieve
-            
-        Returns:
-            List of ContextBlock objects
-        """
-        documents = self.retrieve(query, top_k=top_k)
-        context_blocks = []
-        
-        for doc in documents:
-            block = ContextBlock(
-                content=doc.get("content", ""),
-                source="graph_search",
-                score=doc.get("score", 0.0),
-                metadata={
-                    "doc_id": doc.get("id", ""),
-                    "retrieval_method": "entity_relationship_matching"
-                }
-            )
-            context_blocks.append(block)
-        
-        return context_blocks
-
-
 class SQLRetriever(BaseRetriever):
     """SQL-based retrieval from structured databases."""
 
@@ -369,93 +152,6 @@ class SQLRetriever(BaseRetriever):
                 metadata={
                     "doc_id": doc.get("id", ""),
                     "retrieval_method": "structured_query"
-                }
-            )
-            context_blocks.append(block)
-        
-        return context_blocks
-
-
-class WebSearchRetriever(BaseRetriever):
-    """Web search-based retrieval using Tavily API."""
-
-    def __init__(self, tavily_api_key: str = None):
-        """
-        Initialize WebSearchRetriever with Tavily API.
-
-        Args:
-            tavily_api_key: Tavily API key. If None, loads from environment.
-        """
-        try:
-            self.search_engine = TavilySearch(api_key=tavily_api_key)
-        except RuntimeError as e:
-            logger.warning(f"Tavily initialization warning: {e}")
-            self.search_engine = None
-
-    def retrieve(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
-        """
-        Retrieve results from web search.
-
-        Args:
-            query: Search query
-            top_k: Number of results to retrieve
-
-        Returns:
-            List of search results with id, content, and score
-        """
-        logger.info(f"WebSearchRetriever: searching web for: {query}")
-        
-        if not self.search_engine:
-            logger.warning("Tavily search engine not initialized. Returning empty results.")
-            return []
-        
-        try:
-            # Perform Tavily search
-            results = self.search_engine.search(query, max_results=top_k, search_depth="advanced")
-            
-            # Format results to match BaseRetriever interface
-            formatted_results = []
-            for i, result in enumerate(results):
-                formatted_results.append({
-                    "id": i,
-                    "title": result.get("title", ""),
-                    "url": result.get("url", ""),
-                    "content": result.get("content", ""),
-                    "score": 1.0 - (i * 0.1),  # Ranking score
-                    "source": "web_search"
-                })
-            
-            logger.info(f"Retrieved {len(formatted_results)} web search results")
-            return formatted_results
-            
-        except Exception as e:
-            logger.error(f"Web search retrieval failed: {e}")
-            return []
-    
-    def get_context_blocks(self, query: str, top_k: int = 5) -> List[ContextBlock]:
-        """Retrieve context blocks from web search.
-        
-        Args:
-            query: Search query
-            top_k: Number of results to retrieve
-            
-        Returns:
-            List of ContextBlock objects
-        """
-        documents = self.retrieve(query, top_k=top_k)
-        context_blocks = []
-        
-        for doc in documents:
-            content = f"{doc.get('title', '')}\nURL: {doc.get('url', '')}\n{doc.get('content', '')}"
-            block = ContextBlock(
-                content=content,
-                source="web_search",
-                score=doc.get("score", 0.0),
-                metadata={
-                    "doc_id": doc.get("id", ""),
-                    "title": doc.get("title", ""),
-                    "url": doc.get("url", ""),
-                    "retrieval_method": "web_search"
                 }
             )
             context_blocks.append(block)
