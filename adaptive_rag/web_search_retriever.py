@@ -9,6 +9,7 @@ import logging
 from typing import Dict, List, Any, Optional
 
 from app_config import get_config
+from rag_utils import generate_response, generate_response_from_contexts
 
 logger = logging.getLogger(__name__)
 
@@ -178,6 +179,63 @@ class WebSearchRetriever:
                 "error": str(e)
             }
 
+    def generate_response(self, query: str, max_results: int = 5, llm_model: str = "gpt-3.5-turbo") -> dict:
+        """Perform web search and generate LLM response in one call.
+        
+        Args:
+            query: The user's question
+            max_results: Maximum web results to retrieve
+            llm_model: LLM model to use
+            
+        Returns:
+            Dictionary with:
+            - response: LLM-generated answer
+            - sources_used: List of sources (web_search)
+            - context_count: Number of results used
+            - search_results: List of raw search results
+        """
+        # Perform web search
+        retrieval_result = self.retrieve(query, max_results=max_results)
+        
+        if retrieval_result["error"]:
+            logger.error(f"Web search error: {retrieval_result['error']}")
+            return {
+                "response": f"Web search failed: {retrieval_result['error']}",
+                "sources_used": [],
+                "context_count": 0,
+                "search_results": [],
+                "error": retrieval_result["error"]
+            }
+        
+        # Format context blocks from search results
+        search_results = retrieval_result["results"]
+        context_blocks = []
+        
+        for i, result in enumerate(search_results):
+            content = f"Title: {result.get('title', '')}\nURL: {result.get('url', '')}\nContent: {result.get('content', '')}"
+            context_blocks.append({
+                "content": content,
+                "source": "web_search",
+                "score": 1.0 - (i * 0.1),  # Confidence decreases with rank
+                "metadata": {
+                    "title": result.get("title", ""),
+                    "url": result.get("url", ""),
+                    "result_index": i,
+                    "retrieval_method": "tavily_web_search"
+                }
+            })
+        
+        # Generate response using common function
+        response_data = generate_response_from_contexts(
+            question=query,
+            context_blocks=context_blocks,
+            llm_model=llm_model,
+            include_source_attribution=True
+        )
+        
+        response_data["search_results"] = search_results
+        return response_data
+
 
 class WebSearchLLMPipeline:
     """
@@ -213,39 +271,39 @@ class WebSearchLLMPipeline:
         """
         logger.info(f"Processing query: {query}")
         
-        # Step 1: Retrieve web results
-        logger.info("Step 1: Performing web search...")
-        retrieval_result = self.web_retriever.retrieve(query, max_results=max_results)
+        # Use the common generate_response method from WebSearchRetriever
+        response_data = self.web_retriever.generate_response(query, max_results=max_results, llm_model=self.get_llm_model())
         
-        if retrieval_result["error"]:
-            logger.error(f"Web search error: {retrieval_result['error']}")
-            return {
-                "query": query,
-                "web_results": [],
-                "context": "",
-                "answer": f"Web search failed: {retrieval_result['error']}",
-                "error": retrieval_result["error"]
-            }
-        
-        # Step 2: Format context
-        logger.info("Step 2: Formatting context...")
-        context = retrieval_result["context"]
-        
-        # Step 3: Generate answer using LLM
-        logger.info("Step 3: Generating answer with LLM...")
-        answer = self._generate_answer(query, context)
-        
-        # Return structured result
-        result = {
+        return {
             "query": query,
-            "web_results": retrieval_result["results"],
-            "context": context,
-            "answer": answer,
-            "error": None
+            "web_results": response_data.get("search_results", []),
+            "context": self._format_blocks_to_context(response_data.get("context_blocks", [])),
+            "answer": response_data.get("response", ""),
+            "sources": response_data.get("sources_used", []),
+            "error": response_data.get("error")
         }
+    
+    def get_llm_model(self) -> str:
+        """Get the LLM model name from the LLM instance."""
+        # Try to get model name from LLM
+        if hasattr(self.llm, "model_name"):
+            return self.llm.model_name
+        elif hasattr(self.llm, "model"):
+            return self.llm.model
+        return "gpt-3.5-turbo"
+    
+    def _format_blocks_to_context(self, blocks: List[dict]) -> str:
+        """Format context blocks to readable string."""
+        if not blocks:
+            return "No context available."
         
-        logger.info("Query processing complete")
-        return result
+        formatted = []
+        for block in blocks:
+            content = block.get("content", "")
+            source = block.get("source", "unknown")
+            formatted.append(f"[{source}] {content}")
+        
+        return "\n\n---\n\n".join(formatted)
 
     def _generate_answer(self, query: str, context: str) -> str:
         """
