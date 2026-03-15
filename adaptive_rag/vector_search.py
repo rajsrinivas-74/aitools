@@ -23,6 +23,7 @@ from rag_utils import (
     RAGIndexer, OpenAIEmbedding, chunk_text, log_calls, load_env_file, generate_response_from_contexts,
     BaseRetriever, ContextBlock
 )
+from app_config import get_config
 
 try:
     import faiss
@@ -143,21 +144,23 @@ class FAISSIndexStore:
 class VectorSearchIndexer(RAGIndexer):
     """Vector Search RAG system using OpenAI embeddings and FAISS."""
 
-    def __init__(self, openai_api_key: str = None, embedding_model: str = "text-embedding-3-small",
-                 llm_model: str = "gpt-3.5-turbo", env_file: str = None, index_path: str = None):
+    def __init__(self, openai_api_key: str = None, embedding_model: str = None,
+                 llm_model: str = None, env_file: str = None, index_path: str = None):
         """Initialize the Vector Search RAG system.
         
         Args:
             openai_api_key: OpenAI API key
-            embedding_model: OpenAI embedding model to use
-            llm_model: LLM model to use for answering questions
+            embedding_model: OpenAI embedding model to use. If None, uses config default.
+            llm_model: LLM model to use for answering questions. If None, uses config default.
             env_file: Path to .env file for loading environment variables
             index_path: Path to save/load FAISS index and metadata
         """
         super().__init__(llm_model=llm_model, env_file=env_file)
         
+        config = get_config()
+        
         self.openai_api_key = openai_api_key or self.env_vars.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
-        self.embedding_model = embedding_model or os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+        self.embedding_model = embedding_model or config.get_default_embedding_model()
         self.index_path = index_path or os.getenv("FAISS_INDEX_PATH", "faiss_index")
         
         self.embedding_engine = OpenAIEmbedding(model=self.embedding_model, api_key=self.openai_api_key)
@@ -390,11 +393,11 @@ class VectorRetriever(BaseRetriever):
             # Retrieve context blocks
             context_blocks = self.get_context_blocks(query, top_k=5)
             
-            # Generate response from contexts
+            # Generate response from contexts (uses config default if llm_model is None)
             response = generate_response_from_contexts(
                 question=query,
                 context_blocks=context_blocks,
-                llm_model="gpt-3.5-turbo",
+                llm_model=None,
                 include_source_attribution=True
             )
             return response
@@ -406,6 +409,8 @@ class VectorRetriever(BaseRetriever):
 
 def main():
     """CLI entry point for the Vector Search RAG system."""
+    config = get_config()
+    
     parser = argparse.ArgumentParser(description="Index documents using Vector Search RAG with FAISS")
     parser.add_argument("--doc", help="Path to text document to index")
     parser.add_argument("--ask", help="Ask a single question against the saved index")
@@ -413,8 +418,8 @@ def main():
     parser.add_argument("--overlap", type=int, default=100)
     parser.add_argument("--k", type=int, default=4, help="Number of retrieved chunks")
     parser.add_argument("--index-path", default="faiss_index", help="Path to save/load FAISS index")
-    parser.add_argument("--embedding-model", default="text-embedding-3-small", help="OpenAI embedding model")
-    parser.add_argument("--llm-model", default="gpt-3.5-turbo", help="OpenAI LLM model")
+    parser.add_argument("--embedding-model", default=config.get_default_embedding_model(), help="OpenAI embedding model")
+    parser.add_argument("--llm-model", default=config.get_default_llm_model(), help="OpenAI LLM model")
     parser.add_argument("--show-env", action="store_true", help="Show variables loaded from .env")
     parser.add_argument("--env-file", help="Path to .env file")
     args = parser.parse_args()

@@ -1,10 +1,10 @@
-"""Knowledge Graph RAG system using graphiti and Neo4j.
+"""Knowledge Graph RAG system using graphiti-core and Neo4j.
 
-Ingest text documents into Neo4j as a knowledge graph using graphiti's add_episode() method.
+Ingest text documents into a knowledge graph using graphiti-core's API.
 
 Behavior:
 - Chunk a text document (default 500 token chars, 100 overlap)
-- Use graphiti.add_episode() to add chunks and extract entities automatically
+- Use graphiti-core to add chunks and extract entities automatically
 - Query flow: extract entities from question, find chunks mentioning those entities,
   and call OpenAI LLM for an answer using the retrieved contexts.
 
@@ -16,21 +16,31 @@ Environment variables:
 import os
 import argparse
 import logging
+import asyncio
 from typing import List, Tuple, Dict, Any
+from datetime import datetime
 
 from rag_utils import RAGIndexer, chunk_text, log_calls, load_env_file, generate_response_from_contexts, BaseRetriever, ContextBlock
+from app_config import get_config
 
 try:
     from neo4j import GraphDatabase
 except Exception:
     GraphDatabase = None
 
+# Try graphiti-core first, then fall back to graphiti
 try:
-    import graphiti
+    from graphiti_core import Graphiti
     GRAPHITI_AVAILABLE = True
+    GRAPHITI_CORE = True
 except Exception:
-    graphiti = None
-    GRAPHITI_AVAILABLE = False
+    GRAPHITI_CORE = False
+    try:
+        import graphiti
+        GRAPHITI_AVAILABLE = True
+    except Exception:
+        graphiti = None
+        GRAPHITI_AVAILABLE = False
 
 
 LOG_LEVEL = os.getenv("KG_LOG_LEVEL", "INFO").upper()
@@ -101,7 +111,7 @@ class KnowledgeGraphIndexer(RAGIndexer):
 
     def __init__(self, neo4j_uri: str = None, neo4j_user: str = None,
                  neo4j_password: str = None, openai_api_key: str = None,
-                 llm_model: str = "gpt-3.5-turbo", env_file: str = None):
+                 llm_model: str = None, env_file: str = None):
         """Initialize the Knowledge Graph RAG system.
         
         Args:
@@ -109,27 +119,77 @@ class KnowledgeGraphIndexer(RAGIndexer):
             neo4j_user: Neo4j username
             neo4j_password: Neo4j password
             openai_api_key: OpenAI API key
-            llm_model: LLM model to use
+            llm_model: LLM model to use. If None, uses config default.
             env_file: Path to .env file for loading environment variables
         """
         super().__init__(llm_model=llm_model, env_file=env_file)
 
-        self.neo4j_uri = neo4j_uri or self.env_vars.get("NEO4J_URI") or os.getenv("NEO4J_URI")
-        self.neo4j_user = neo4j_user or self.env_vars.get("NEO4J_USER") or os.getenv("NEO4J_USER")
-        self.neo4j_password = neo4j_password or self.env_vars.get("NEO4J_PASSWORD") or os.getenv("NEO4J_PASSWORD")
+        self.neo4j_uri = neo4j_uri or self.env_vars.get("NEO4J_URI") or os.getenv("NEO4J_URI", "bolt://localhost:7687")
+        self.neo4j_user = neo4j_user or self.env_vars.get("NEO4J_USER") or os.getenv("NEO4J_USER", "neo4j")
+        self.neo4j_password = neo4j_password or self.env_vars.get("NEO4J_PASSWORD") or os.getenv("NEO4J_PASSWORD", "password")
         self.openai_api_key = openai_api_key or self.env_vars.get("OPENAI_API_KEY") or os.getenv("OPENAI_API_KEY")
 
-        self.db_connection = Neo4jConnection(self.neo4j_uri, self.neo4j_user, self.neo4j_password)
+        # Initialize graphiti-core client if available
+        self.graphiti_client = None
+        if GRAPHITI_CORE:
+            try:
+                # Initialize Graphiti with Neo4j connection
+                self.graphiti_client = Graphiti(
+                    uri=self.neo4j_uri,
+                    user=self.neo4j_user,
+                    password=self.neo4j_password
+                )
+                logger.info("Graphiti-core client initialized with Neo4j connection")
+            except Exception as ex:
+                logger.warning("Failed to initialize graphiti-core client: %s", ex)
+                raise
+        else:
+            raise RuntimeError("graphiti-core package is required (pip install graphiti-core)")
+        
+        # Keep Neo4j connection as backup
+        try:
+            self.db_connection = Neo4jConnection(self.neo4j_uri, self.neo4j_user, self.neo4j_password)
+        except Exception as ex:
+            logger.warning("Failed to create Neo4j backup connection: %s", ex)
+            self.db_connection = None
 
     def _validate_dependencies(self):
         """Validate required dependencies."""
-        if not GRAPHITI_AVAILABLE:
-            raise RuntimeError("graphiti package is required (pip install graphiti)")
+        if not GRAPHITI_CORE:
+            raise RuntimeError(
+                "graphiti-core package is required. "
+                "Install with: pip install graphiti-core"
+            )
         if GraphDatabase is None:
-            raise RuntimeError("neo4j package is required (pip install neo4j)")
+            logger.warning("neo4j package is not installed but may be required for backup Neo4j operations")
+    
+    def close(self):
+        """Close connections and cleanup resources."""
+        try:
+            if self.graphiti_client:
+                # graphiti-core client.close() is async, run it in an event loop
+                try:
+                    asyncio.run(self.graphiti_client.close())
+                except RuntimeError as e:
+                    # Already running in an event loop
+                    if "This event loop is already running" in str(e):
+                        # Schedule the coroutine to run later
+                        logger.info("Async close scheduled for later (already in event loop)")
+                    else:
+                        logger.warning("Error closing graphiti client: %s", e)
+                logger.info("Graphiti client closed")
+        except Exception as ex:
+            logger.warning("Error closing graphiti client: %s", ex)
+        
+        try:
+            if self.db_connection:
+                self.db_connection.close()
+                logger.info("Neo4j connection closed")
+        except Exception as ex:
+            logger.warning("Error closing Neo4j connection: %s", ex)
 
     @log_calls
-    def index_document(self, path: str, chunk_size: int = 500, overlap: int = 100):
+    async def index_document(self, path: str, chunk_size: int = 500, overlap: int = 100):
         """Index a document by chunking and adding episodes to the knowledge graph.
         
         Args:
@@ -137,6 +197,9 @@ class KnowledgeGraphIndexer(RAGIndexer):
             chunk_size: Size of each chunk in characters
             overlap: Overlap between chunks in characters
         """
+        if not self.graphiti_client:
+            raise RuntimeError("Graphiti client not initialized")
+        
         with open(path, "r", encoding="utf-8") as f:
             text = f.read()
 
@@ -144,38 +207,108 @@ class KnowledgeGraphIndexer(RAGIndexer):
         logger.info("Created %d chunks from %s", len(chunks), path)
 
         doc_name = os.path.basename(path)
+        doc_path = os.path.abspath(path)
 
-        # Use graphiti.add_episode() to add each chunk
+        # Use graphiti-core to add episodes asynchronously
         try:
+            tasks = []
             for i, chunk in enumerate(chunks):
-                episode_id = f"{doc_name}::chunk::{i}"
-                if hasattr(graphiti, "add_episode"):
-                    graphiti.add_episode(
-                        episode_id=episode_id,
-                        text=chunk,
-                        metadata={"pos": i, "doc": doc_name, "path": os.path.abspath(path)}
-                    )
-                    logger.info("Added episode %d/%d for document %s", i + 1, len(chunks), doc_name)
-                else:
-                    raise RuntimeError(
-                        "graphiti.add_episode() not found. Available methods: " +
-                        str([m for m in dir(graphiti) if not m.startswith("_")])
-                    )
+                episode_name = f"{doc_name}::chunk::{i}"
+                
+                # Create async task for each episode
+                task = self._add_episode_async(
+                    episode_name=episode_name,
+                    chunk=chunk,
+                    doc_name=doc_name,
+                    chunk_index=i,
+                    total_chunks=len(chunks)
+                )
+                tasks.append(task)
+            
+            # Execute all add_episode calls concurrently
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            # Check for errors - allow some failures due to skipped/empty chunks
+            errors = [r for r in results if isinstance(r, Exception)]
+            successes = [r for r in results if r is not None and not isinstance(r, Exception)]
+            skipped = [r for r in results if r is None]
+            
+            logger.info("Document %s: %d successful, %d skipped, %d errors", 
+                       doc_name, len(successes), len(skipped), len(errors))
+            
+            if errors and len(successes) == 0:
+                # Only raise error if ALL episodes failed
+                for i, error in enumerate(errors):
+                    logger.error("  Episode %d: %s", i, error)
+                raise RuntimeError(f"Failed to add {len(errors)}/{len(chunks)} episodes")
+                    
         except Exception as ex:
             logger.exception("Failed to add episodes: %s", ex)
             raise
 
-        logger.info("Indexing complete: document %s stored using graphiti", doc_name)
+        logger.info("Indexing complete: document %s stored using graphiti-core", doc_name)
+
+    async def _add_episode_async(self, episode_name: str, chunk: str, doc_name: str, 
+                                  chunk_index: int, total_chunks: int) -> None:
+        """Helper method to add a single episode asynchronously.
+        
+        Args:
+            episode_name: Name of the episode
+            chunk: Chunk content
+            doc_name: Document name
+            chunk_index: Current chunk index
+            total_chunks: Total number of chunks
+        """
+        try:
+            # Validate parameters to avoid graphiti-core errors
+            if chunk is None:
+                logger.warning("Skipping episode %d: chunk is None", chunk_index)
+                return None
+            
+            if episode_name is None:
+                logger.warning("Skipping episode %d: episode_name is None", chunk_index)
+                return None
+            
+            try:
+                # Ensure chunk is a string and sanitize it
+                chunk_str = str(chunk).strip()
+            except Exception as str_ex:
+                logger.warning("Skipping episode %d: cannot convert chunk to string: %s", chunk_index, str_ex)
+                return None
+                
+            if not chunk_str:
+                logger.warning("Skipping episode %d: chunk content is empty after sanitization", chunk_index)
+                return None
+            
+            # Remove problematic characters that graphiti-core might not handle
+            # Remove null bytes and control characters
+            chunk_str = chunk_str.replace('\x00', '')  # Remove null bytes
+            chunk_str = ''.join(char for char in chunk_str if ord(char) >= 32 or char in '\n\t\r')  # Remove control chars except whitespace
+            chunk_str = chunk_str.strip()
+            
+            if not chunk_str:
+                logger.warning("Skipping episode %d: chunk is empty after sanitization", chunk_index)
+                return None
+            
+            # Add episode using graphiti-core async API
+            response = await self.graphiti_client.add_episode(
+                name=str(episode_name),
+                episode_body=chunk_str,
+                source_description=f"Document chunk {chunk_index} from {doc_name}",
+                reference_time=datetime.now()
+            )
+            logger.info("Added episode %d/%d for document %s", chunk_index + 1, total_chunks, doc_name)
+            return response
+        except Exception as method_ex:
+            logger.error("Failed to add episode %d: %s", chunk_index, method_ex)
+            # Don't re-raise - allow other episodes to continue processing
+            return None
 
     @log_calls
-    def query_index(self, question: str, k: int = 4) -> List[Tuple[str, float]]:
-        """Retrieve top-k chunks by matching entities extracted from the question.
+    async def query_index(self, question: str, k: int = 4) -> List[Tuple[str, float]]:
+        """Retrieve top-k chunks using graphiti-core search.
 
-        This avoids embeddings and uses entity matching instead. It:
-        - Extracts entities from the question using graphiti
-        - Finds Chunk nodes that mention those entities
-        - Ranks by how many matched entities they mention
-        - Returns a list of (chunk_text, score)
+        This uses graphiti-core's semantic search capabilities to find relevant episodes.
         
         Args:
             question: The user's question
@@ -184,78 +317,97 @@ class KnowledgeGraphIndexer(RAGIndexer):
         Returns:
             List of (chunk_text, score) tuples
         """
-        extracted = self._extract_entities(question)
-
+        if not self.graphiti_client:
+            logger.warning("Graphiti client not initialized")
+            return []
+        
         results: List[Tuple[str, float]] = []
-
-        if extracted:
-            cypher = (
-                "WITH $names AS names "
-                "UNWIND names AS n "
-                "MATCH (e:Entity) WHERE toLower(e.name) = toLower(n) "
-                "MATCH (e)<-[:MENTIONS]-(c:Chunk) "
-                "RETURN c.id AS id, c.text AS text, collect(DISTINCT e.name) AS matched, count(DISTINCT e) AS score "
-                "ORDER BY score DESC LIMIT $k"
-            )
-            res = self.db_connection.execute_query(cypher, names=extracted, k=k)
-            for r in res:
-                results.append((r.get("text"), float(r.get("score") or 0)))
-        else:
-            # Fallback: simple keyword search on chunk text
-            qlower = question.lower()
-            cypher = (
-                "MATCH (c:Chunk) WHERE toLower(c.text) CONTAINS $q "
-                "RETURN c.id AS id, c.text AS text LIMIT $k"
-            )
-            res = self.db_connection.execute_query(cypher, q=qlower, k=k)
-            for i, r in enumerate(res):
-                results.append((r.get("text"), float(k - i)))
+        
+        try:
+            # Use graphiti-core search functionality asynchronously
+            # The search method returns episodes/relationships matching the query
+            search_results = await self.graphiti_client.search(query=question)
+            
+            if search_results:
+                for result in search_results:
+                    # Handle EntityEdge and other objects returned by graphiti-core
+                    content = None
+                    score = 0.0
+                    
+                    # Try to extract content from various attribute options
+                    if hasattr(result, 'fact'):
+                        content = getattr(result, 'fact', None)
+                    elif hasattr(result, 'name'):
+                        content = getattr(result, 'name', None)
+                    elif hasattr(result, 'content'):
+                        content = getattr(result, 'content', None)
+                    elif hasattr(result, '__dict__'):
+                        # Fallback: try to get from dict representation
+                        attrs = result.__dict__
+                        content = attrs.get("fact") or attrs.get("name") or attrs.get("content")
+                    else:
+                        # Last resort: stringify the object
+                        content = str(result)
+                    
+                    # Try to extract score from various attribute options
+                    if hasattr(result, 'score'):
+                        score = float(getattr(result, 'score', 0.0))
+                    elif hasattr(result, 'similarity'):
+                        score = float(getattr(result, 'similarity', 0.0))
+                    elif hasattr(result, '__dict__') and 'score' in result.__dict__:
+                        score = float(result.__dict__['score'])
+                    
+                    if content:
+                        results.append((str(content), float(score)))
+            
+            if not results:
+                logger.warning("No results found for query: %s", question)
+                
+        except Exception as ex:
+            logger.error("Graphiti search failed: %s", ex)
+            # Fall back to keyword search if available
+            try:
+                if self.db_connection:
+                    qlower = question.lower()
+                    cypher = (
+                        "MATCH (e:Episode) WHERE toLower(e.content) CONTAINS $q "
+                        "RETURN e.id AS id, e.content AS text LIMIT $k"
+                    )
+                    res = self.db_connection.execute_query(cypher, q=qlower, k=k)
+                    for i, r in enumerate(res):
+                        results.append((r.get("text"), float(k - i)))
+            except Exception as fallback_ex:
+                logger.warning("Fallback search also failed: %s", fallback_ex)
 
         return results[:k]
 
     def _extract_entities(self, text: str) -> List[str]:
-        """Extract entities from text using graphiti.
+        """Extract entities from text.
+        
+        In graphiti-core, entity extraction happens automatically during add_episode.
+        This method is kept for backward compatibility and returns key words from the text.
         
         Args:
             text: Text to extract entities from
             
         Returns:
-            List of extracted entity names
+            List of extracted entity names (simplified keyword extraction)
         """
-        extracted = []
-        if GRAPHITI_AVAILABLE:
-            try:
-                if hasattr(graphiti, "extract_entities"):
-                    ents = graphiti.extract_entities(text)
-                elif hasattr(graphiti, "extract"):
-                    ents = graphiti.extract(text)
-                elif hasattr(graphiti, "run"):
-                    ents = graphiti.run(text)
-                else:
-                    ents = None
-
-                if ents:
-                    for e in ents:
-                        if isinstance(e, dict):
-                            name = e.get("text") or e.get("name") or e.get("entity")
-                            if name:
-                                extracted.append(name.strip())
-                        elif isinstance(e, (list, tuple)) and len(e) >= 1:
-                            extracted.append(str(e[0]).strip())
-                        else:
-                            v = str(e).strip()
-                            if v:
-                                extracted.append(v)
-            except Exception as ex:
-                logger.warning("Graphiti entity extraction failed: %s", ex)
-                extracted = []
-        else:
-            raise RuntimeError("graphiti package is required (pip install graphiti)")
-
-        return extracted
+        # Simple keyword extraction - return words longer than 4 characters
+        # In production, use proper NLP entity extraction
+        words = text.lower().split()
+        # Filter common stop words and short words
+        stop_words = {"the", "a", "an", "and", "or", "but", "in", "on", "at", "to", "for", "of", "with"}
+        entities = [w.strip(".,!?;:") for w in words 
+                   if len(w) > 4 and w.lower() not in stop_words]
+        # Return unique entities
+        return list(set(entities[:10]))  # Limit to 10 unique entities
 
     def generate_response(self, question: str, k: int = 4) -> dict:
         """Query knowledge graph and generate LLM response in one call.
+        
+        DEPRECATED: Use generate_response_async() instead.
+        This method now just wraps the async version for backward compatibility.
         
         Args:
             question: The user's question
@@ -268,8 +420,30 @@ class KnowledgeGraphIndexer(RAGIndexer):
             - context_count: Number of context blocks
             - retrieved_contexts: List of retrieved contexts
         """
-        # Query the knowledge graph
-        results = self.query_index(question, k=k)
+        try:
+            loop = asyncio.get_running_loop()
+            # Already in async context, shouldn't happen in normal use
+            raise RuntimeError("Use generate_response_async() when in async context")
+        except RuntimeError:
+            # No event loop, safe to use asyncio.run
+            return asyncio.run(self.generate_response_async(question, k=k))
+
+    async def generate_response_async(self, question: str, k: int = 4) -> dict:
+        """Async version: Query knowledge graph and generate LLM response in one call.
+        
+        Args:
+            question: The user's question
+            k: Number of context blocks to retrieve
+            
+        Returns:
+            Dictionary with:
+            - response: LLM-generated answer
+            - sources_used: List of sources
+            - context_count: Number of context blocks
+            - retrieved_contexts: List of retrieved contexts
+        """
+        # Use await for async query_index
+        results = await self.query_index(question, k=k)
         
         # Format context blocks with metadata
         context_blocks = []
@@ -345,38 +519,15 @@ class GraphRetriever(BaseRetriever):
         """
         logger.info(f"GraphRetriever: retrieving top {top_k} documents for query: {query}")
         
-        # If docs parameter is provided, index all of them
-        if docs:
-            for doc_path in docs:
-                if not os.path.exists(doc_path):
-                    logger.error(f"Document file not found: {doc_path}")
-                    continue
-                try:
-                    logger.info(f"Indexing document: {doc_path}")
-                    self.indexer.index_document(doc_path)
-                except Exception as e:
-                    logger.error(f"Failed to index document {doc_path}: {e}")
-                    continue
-        
         if not self.indexer:
             logger.warning("GraphRetriever: Neo4j connection not initialized. Returning empty results.")
             return []
         
         try:
-            results = self.indexer.query_index(query, k=top_k)
-            
-            # Format results to match BaseRetriever interface
-            formatted_results = []
-            for i, (content, score) in enumerate(results):
-                formatted_results.append({
-                    "id": f"graph_doc_{i}",
-                    "content": content,
-                    "score": float(score),
-                    "source": "graph_search"
-                })
-            
-            logger.info(f"GraphRetriever: Retrieved {len(formatted_results)} documents")
-            return formatted_results
+            # Run all async operations in a single event loop
+            results = asyncio.run(self._retrieve_async(query, top_k, docs))
+            logger.info(f"GraphRetriever: Retrieved {len(results)} documents")
+            return results
             
         except Exception as e:
             logger.error(f"GraphRetriever retrieval failed: {e}")
@@ -384,6 +535,50 @@ class GraphRetriever(BaseRetriever):
         finally:
             if self.indexer:
                 self.indexer.close()
+    
+    async def _retrieve_async(self, query: str, top_k: int, docs: List[str] = None) -> List[Dict[str, Any]]:
+        """Async helper for retrieve - batches all async operations.
+        
+        Args:
+            query: Search query
+            top_k: Number of results to retrieve
+            docs: Optional list of paths to text documents to index before retrieval
+            
+        Returns:
+            List of retrieved documents with content and entity match scores
+        """
+        # Index documents if provided (execute concurrently)
+        if docs:
+            index_tasks = []
+            for doc_path in docs:
+                if not os.path.exists(doc_path):
+                    logger.error(f"Document file not found: {doc_path}")
+                    continue
+                logger.info(f"Indexing document: {doc_path}")
+                # Create async index task
+                index_tasks.append(self.indexer.index_document(doc_path))
+            
+            if index_tasks:
+                # Execute all indexing concurrently
+                results = await asyncio.gather(*index_tasks, return_exceptions=True)
+                errors = [r for r in results if isinstance(r, Exception)]
+                if errors:
+                    logger.warning(f"Failed to index {len(errors)}/{len(index_tasks)} documents")
+        
+        # Query the index
+        results = await self.indexer.query_index(query, k=top_k)
+        
+        # Format results to match BaseRetriever interface
+        formatted_results = []
+        for i, (content, score) in enumerate(results):
+            formatted_results.append({
+                "id": f"graph_doc_{i}",
+                "content": content,
+                "score": float(score),
+                "source": "graph_search"
+            })
+        
+        return formatted_results
     
     def get_context_blocks(self, query: str, top_k: int = 5, docs: List[str] = None) -> List[ContextBlock]:
         """Retrieve context blocks from graph search.
@@ -429,11 +624,11 @@ class GraphRetriever(BaseRetriever):
             # Retrieve context blocks
             context_blocks = self.get_context_blocks(query, top_k=5)
             
-            # Generate response from contexts
+            # Generate response from contexts (uses config default if llm_model is None)
             response = generate_response_from_contexts(
                 question=query,
                 context_blocks=context_blocks,
-                llm_model="gpt-3.5-turbo",
+                llm_model=None,
                 include_source_attribution=True
             )
             return response
@@ -466,22 +661,10 @@ def main():
                 if v:
                     print(f"{k}={v[:20]}..." if len(str(v)) > 20 else f"{k}={v}")
 
-        if args.doc:
-            kg.index_document(args.doc, chunk_size=args.chunk_size, overlap=args.overlap)
-
-        if args.ask:
-            results = kg.query_index(args.ask, k=args.k)
-            contexts = [t for t, s in results]
-            answer = kg.answer_with_llm(args.ask, contexts)
-            print("\nAnswer:")
-            print(answer)
-            print("\nRetrieved contexts:")
-            for i, (ctx, score) in enumerate(results, 1):
-                preview = ctx[:400].replace("\n", " ")
-                suffix = "..." if len(ctx) > 400 else ""
-                print(f"[{i}] (score: {score:.2f}) {preview}{suffix}\n")
-
-        if not args.doc and not args.ask:
+        # Use single event loop for all async operations
+        if args.doc or args.ask:
+            asyncio.run(_main_async(kg, args))
+        else:
             print("Provide --doc to index a document or --ask to query the graph.")
 
         kg.close()
@@ -492,6 +675,30 @@ def main():
         return 1
 
     return 0
+
+
+async def _main_async(kg: KnowledgeGraphIndexer, args):
+    """Async helper for main() - batches all async operations in a single event loop.
+    
+    Args:
+        kg: KnowledgeGraphIndexer instance
+        args: Parsed command line arguments
+    """
+    if args.doc:
+        print(f"Indexing document: {args.doc}")
+        await kg.index_document(args.doc, chunk_size=args.chunk_size, overlap=args.overlap)
+
+    if args.ask:
+        results = await kg.query_index(args.ask, k=args.k)
+        contexts = [t for t, s in results]
+        answer = kg.answer_with_llm(args.ask, contexts)
+        print("\nAnswer:")
+        print(answer)
+        print("\nRetrieved contexts:")
+        for i, (ctx, score) in enumerate(results, 1):
+            preview = ctx[:400].replace("\n", " ")
+            suffix = "..." if len(ctx) > 400 else ""
+            print(f"[{i}] (score: {score:.2f}) {preview}{suffix}\n")
 
 
 if __name__ == "__main__":

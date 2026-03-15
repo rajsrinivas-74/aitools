@@ -14,6 +14,8 @@ import logging
 from typing import List, Callable, Dict, Any
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+import inspect
+from functools import wraps
 
 try:
     from dotenv import load_dotenv, dotenv_values
@@ -25,6 +27,8 @@ try:
     import openai
 except Exception:
     openai = None
+
+from app_config import get_config
 
 
 logger = logging.getLogger(__name__)
@@ -126,15 +130,21 @@ class RAGIndexer(ABC):
     Provides common initialization patterns for LLM and environment loading.
     """
     
-    def __init__(self, llm_model: str = "gpt-3.5-turbo", env_file: str = None):
+    def __init__(self, llm_model: str = None, env_file: str = None):
         """Initialize RAG indexer.
         
         Args:
-            llm_model: LLM model to use for answering
+            llm_model: LLM model to use for answering. If None, uses config default.
             env_file: Path to .env file
         """
         self.env_vars = load_env_file(env_file)
-        self.llm_model = llm_model or os.getenv("LLM_MODEL", "gpt-3.5-turbo")
+        
+        # Use provided model or get from config
+        if llm_model is None:
+            config = get_config()
+            llm_model = config.get_default_llm_model()
+        
+        self.llm_model = llm_model
         self._validate_dependencies()
     
     @abstractmethod
@@ -248,24 +258,40 @@ def _short_repr(obj, maxlen: int = 200) -> str:
 def log_calls(func: Callable) -> Callable:
     """Decorator to log function entry, exit, and exceptions.
     
+    Supports both synchronous and asynchronous functions.
+    
     Args:
         func: Function to decorate
         
     Returns:
         Wrapped function with logging
     """
-    def wrapper(*args, **kwargs):
-        try:
-            logger.debug("ENTER %s args=%s kwargs=%s", func.__name__, _short_repr(args), _short_repr(kwargs))
-            res = func(*args, **kwargs)
-            logger.debug("EXIT %s -> %s", func.__name__, _short_repr(res))
-            return res
-        except Exception as e:
-            logger.exception("EXCEPTION in %s: %s", func.__name__, e)
-            raise
-    wrapper.__name__ = func.__name__
-    wrapper.__doc__ = func.__doc__
-    return wrapper
+    # Handle async functions
+    if inspect.iscoroutinefunction(func):
+        @wraps(func)
+        async def async_wrapper(*args, **kwargs):
+            try:
+                logger.debug("ENTER %s args=%s kwargs=%s", func.__name__, _short_repr(args), _short_repr(kwargs))
+                res = await func(*args, **kwargs)
+                logger.debug("EXIT %s -> %s", func.__name__, _short_repr(res))
+                return res
+            except Exception as e:
+                logger.exception("EXCEPTION in %s: %s", func.__name__, e)
+                raise
+        return async_wrapper
+    else:
+        # Handle sync functions
+        @wraps(func)
+        def sync_wrapper(*args, **kwargs):
+            try:
+                logger.debug("ENTER %s args=%s kwargs=%s", func.__name__, _short_repr(args), _short_repr(kwargs))
+                res = func(*args, **kwargs)
+                logger.debug("EXIT %s -> %s", func.__name__, _short_repr(res))
+                return res
+            except Exception as e:
+                logger.exception("EXCEPTION in %s: %s", func.__name__, e)
+                raise
+        return sync_wrapper
 
 
 # ============================================================================
@@ -447,7 +473,7 @@ class BaseRetriever(ABC):
 # ============================================================================
 
 def generate_response_from_contexts(question: str, context_blocks: List, 
-                                    llm_model: str = "gpt-3.5-turbo",
+                                    llm_model: str = None,
                                     include_source_attribution: bool = True) -> str:
     """Generate LLM response from context blocks.
     
@@ -457,7 +483,7 @@ def generate_response_from_contexts(question: str, context_blocks: List,
     Args:
         question: The user's question
         context_blocks: List of context strings or ContextBlock objects
-        llm_model: LLM model to use
+        llm_model: LLM model to use. If None, uses config default.
         include_source_attribution: Whether to include source info in formatted context
         
     Returns:
@@ -469,9 +495,23 @@ def generate_response_from_contexts(question: str, context_blocks: List,
     if openai is None:
         raise RuntimeError("openai package is required (pip install openai)")
     
+    # Use default model from config if not provided
+    if llm_model is None:
+        config = get_config()
+        llm_model = config.get_default_llm_model()
+    
     # Extract content from various formats
     context_texts = []
     sources_used = set()
+    
+    # DEBUG: Log context block types
+    logger.warning("Processing %d context blocks", len(context_blocks))
+    for i, block in enumerate(context_blocks):
+        block_type = type(block).__name__
+        logger.warning("Block %d: type=%s, len=%s", i, block_type, len(str(block)) if block else 0)
+        if i == 0:
+            block_str = str(block)
+            logger.warning("Block 0 first 200 chars: %r", block_str[:200])
     
     for block in context_blocks:
         if isinstance(block, ContextBlock):
@@ -499,19 +539,102 @@ def generate_response_from_contexts(question: str, context_blocks: List,
             context_texts.append(str(block))
     
     # Generate response
-    system_prompt = (
-        "You are a helpful assistant. Use the provided context to answer the user's question. "
-        "If the answer is not contained in the context, say you do not know the answer. "
-        "Be concise and direct."
-    )
+    system_prompt = """
+You are an AI assistant answering questions using retrieved knowledge.
+
+You will be given:
+1. A user question
+2. Context retrieved from external sources
+
+Guidelines:
+- Answer the question using ONLY the information in the provided context.
+- Do not use prior knowledge or make assumptions.
+- If the answer cannot be found in the context, respond with:
+  "I do not know based on the provided context."
+- If multiple context snippets are provided, combine relevant information.
+- If the context contains conflicting information, acknowledge the uncertainty.
+- Keep the response concise, factual, and directly related to the user's question.
+"""
+
     
+    # Sanitize context text to handle special characters properly
     context_text = "\n\n---\n\n".join(context_texts) if context_texts else "No context available."
-    user_prompt = f"Context:\n{context_text}\n\nQuestion: {question}\n\nAnswer:"
     
+     # Remove null bytes and normalize line endings for ASCII-safe encoding
+    context_text = context_text.replace('\x00', '')  # Remove null bytes
+    context_text = context_text.replace('\r\n', '\n')  # Normalize CRLF to LF
+    context_text = context_text.replace('\r', '\n')  # Normalize CR to LF
+    
+    # Remove potentially problematic Unicode characters but keep spaces and common punctuation
+    # Keep ASCII printable chars (32-126) and common whitespace (9=tab, 10=lf)
+    cleaned_chars = []
+    for char in context_text:
+        code = ord(char)
+        # Keep: spaces (32), printable ASCII (33-126), tab (9), newline (10)
+        if code >= 32 and code <= 126:  # Printable ASCII
+            cleaned_chars.append(char)
+        elif code in (9, 10):  # Tab and newline
+            cleaned_chars.append(char)
+        elif code > 127:  # Try to keep valid UTF-8 characters
+            try:
+                char.encode('utf-8')
+                cleaned_chars.append(char)
+            except:
+                # Skip invalid UTF-8
+                pass
+        # Skip all other control characters
+    context_text = ''.join(cleaned_chars).strip()
+    
+    # Truncate if too long (prevent token overflow)
+    max_context_length = 7000  # Leave room for question and response
+    if len(context_text) > max_context_length:
+        context_text = context_text[:max_context_length] + "\n[... context truncated ...]"
+    
+    user_prompt = f"Context:\n{context_text}\n\nQuestion: {question}\n\nAnswer:"
+    logger.debug("Prepared user prompt length: %d chars", len(user_prompt))
+    
+    # Additional safety: ensure UTF-8 encoding
+    try:
+        context_text_utf8 = context_text.encode('utf-8', errors='replace').decode('utf-8')
+        user_prompt_utf8 = user_prompt.encode('utf-8', errors='replace').decode('utf-8')
+        system_prompt_utf8 = system_prompt.encode('utf-8', errors='replace').decode('utf-8')
+    except Exception as enc_err:
+        logger.warning("Could not ensure UTF-8 encoding: %s", enc_err)
+        user_prompt_utf8 = user_prompt
+        system_prompt_utf8 = system_prompt
+    
+    # Create message list with UTF-8 safe content
     messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt},
+        {"role": "system", "content": system_prompt_utf8},
+        {"role": "user", "content": user_prompt_utf8},
     ]
+    
+    # Log the exact JSON that will be sent
+    import json
+    json_payload = json.dumps(messages)
+    logger.warning("JSON body length: %d, first 300 chars: %r", len(json_payload), json_payload[:300])
+    
+    # Debug: Check content before sending
+    logger.warning("System prompt length: %d", len(system_prompt))
+    logger.warning("User prompt length: %d", len(user_prompt))
+    logger.warning("User prompt first 200 chars: %r", user_prompt[:200])
+    logger.warning("User prompt last 200 chars: %r", user_prompt[-200:])
+    
+    # Verify JSON is valid
+    import json
+    try:
+        json_str = json.dumps(messages)
+        logger.warning("JSON payload size: %d bytes", len(json_str))
+    except Exception as json_err:
+        logger.error("JSON serialization error: %s", json_err)
+        # Try to extract which character is causing the issue
+        for i, char in enumerate(user_prompt):
+            try:
+                json.dumps({"test": user_prompt[:i+1]})
+            except:
+                logger.error("JSON error at position %d, char code: %d, char: %r", i, ord(char), char)
+                break
+        raise
     
     try:
         resp = openai.chat.completions.create(
@@ -520,11 +643,31 @@ def generate_response_from_contexts(question: str, context_blocks: List,
             temperature=0.0
         )
         return resp.choices[0].message.content.strip()
-    except AttributeError:
-        # Older OpenAI client API
-        resp = openai.ChatCompletion.create(
-            model=llm_model,
-            messages=messages,
-            temperature=0.0
-        )
-        return resp['choices'][0]['message']['content'].strip()
+    except Exception as openai_err:
+        # Check if it's a BadRequest/JSON error - try with NO context, just the question
+        error_str = str(openai_err)
+        if ("400" in error_str or "BadRequest" in error_str or "JSON" in error_str) and "could not parse" in error_str:
+            logger.warning("JSON encoding error detected, trying without context")
+            # Try with just question, no context
+            simple_prompt = f"Answer this question: {question}"
+            simple_messages = [
+                {"role": "user", "content": simple_prompt},
+            ]
+            try:
+                logger.warning("Retrying with question-only prompt")
+                resp = openai.chat.completions.create(
+                    model=llm_model,
+                    messages=simple_messages,
+                    temperature=0.0
+                )
+                answer = resp.choices[0].message.content.strip()
+                return f"Answer (without source context): {answer}\n\nNote: Context synthesis failed due to JSON encoding issues."
+            except Exception as retry_err:
+                logger.error("Question-only retry also failed: %s", retry_err)
+                # Return a summary of what we found instead of trying OpenAI again
+                logger.warning("Giving up on OpenAI, returning summary of retrieved context")
+                summary = f"Retrieved {len(context_blocks)} documents related to: {question}\n\nContext summary:\n"
+                for i, block in enumerate(context_blocks[:3]):  # Just summarize first 3
+                    block_str = str(block)[:300]
+                    summary += f"\n{i+1}. {block_str}..."
+                return summary

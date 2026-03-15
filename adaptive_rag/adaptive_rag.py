@@ -10,9 +10,12 @@ Uses centralized configuration and dependency injection for single initializatio
 
 import json
 import logging
+import argparse
+import sys
 from typing import Dict, List, Any, Optional, Tuple
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from app_config import get_config
 from enhance_prompt import PromptEnhancer
@@ -178,20 +181,26 @@ class QueryOrchestrator:
         
         logger.info("QueryOrchestrator initialized with Vector, Graph, and Web Search indexers")
 
-    def orchestrate(self, query: str, use_multiple_retrievers: bool = False, docs: List[str] = None) -> Dict[str, Any]:
+    def orchestrate(self, query: str, context_doc_paths: List[str] = None, use_multiple_retrievers: bool = False) -> Dict[str, Any]:
         """
         Orchestrate the full RAG pipeline from raw user query.
 
         Args:
-            query: Raw user query string
-            use_multiple_retrievers: If True, call multiple retrievers and aggregate contexts
-            docs: Optional list of paths to RAG content text files for vector and graph retrieval
+            query: Raw user query string (required) - The question/request from the user
+            context_doc_paths: Optional list of file paths to RAG content documents
+                              These documents are indexed for vector search and graph retrieval
+                              Example: ["docs/file1.txt", "docs/file2.txt"]
+            use_multiple_retrievers: If True, uses multiple retrievers (vector, graph, web) 
+                                    and aggregates contexts. If False, uses single best strategy.
 
         Returns:
-            Final response with answer and metadata. On error, returns error response with error details.
+            Final response dictionary with answer and metadata. On error, returns error response with error details.
         """
         try:
             # Step 0: Validate input query
+            logger.info(f"User query received: {query}")
+            if context_doc_paths:
+                logger.info(f"Context document paths provided: {context_doc_paths}")
             validated_query = validate_query(query)
             logger.info(f"Query validation passed for: {validated_query[:50]}...")
             
@@ -222,9 +231,9 @@ class QueryOrchestrator:
             strategy = query_analysis["strategy"]
             
             if use_multiple_retrievers:
-                result = self._execute_multi_retriever_path(retrieval_query, query_analysis, docs=docs)
+                result = self._execute_multi_retriever_path(retrieval_query, query_analysis, context_doc_paths=context_doc_paths)
             else:
-                result = self._execute_single_retriever_path(retrieval_query, strategy, query_analysis, docs=docs)
+                result = self._execute_single_retriever_path(retrieval_query, strategy, query_analysis, context_doc_paths=context_doc_paths)
             
             # Step 3: Compile final response
             answer, aggregated_context, all_documents, fallback_used, sub_queries_executed = result
@@ -304,26 +313,43 @@ class QueryOrchestrator:
 
         logger.info(f"Orchestrating query: {query} | Type: {query_type} | Strategy: {strategy}")
 
-        # Select final retrieval query based on confidence
-        retrieval_query = self._select_retrieval_query(query, rewrite_query, confidence)
+        # Optimize the query using PromptEnhancer
+        logger.info(f"Optimizing rewritten query: {rewrite_query}")
+        try:
+            optimization_result = self.prompt_enhancer.optimize_prompt(rewrite_query, max_iters=2, target_score=7)
+            if optimization_result.get("final"):
+                optimized_query = optimization_result["final"].get("improved", rewrite_query)
+                logger.info(f"Query optimization complete. Optimized query: {optimized_query}")
+                logger.info(f"Optimization history: {json.dumps([{'iteration': h['iteration'], 'score': h['score']} for h in optimization_result.get('history', [])], indent=2)}")
+            else:
+                optimized_query = rewrite_query
+                logger.warning("Query optimization produced no improvements, using original rewritten query")
+        except Exception as e:
+            logger.error(f"Query optimization failed: {e}, falling back to rewritten query")
+            optimized_query = rewrite_query
+
+        # Use ONLY the optimized query for all subsequent retrieval processing
+        retrieval_query = optimized_query
+        logger.info(f"Using optimized query for retrieval: {retrieval_query}")
         
         return {
             "query_type": query_type,
             "strategy": strategy,
             "confidence": confidence,
             "retrieval_query": retrieval_query,
+            "optimized_query": optimized_query,
             "sub_queries": sub_queries,
         }
     
     def _execute_single_retriever_path(self, query: str, strategy: str, 
-                                      analysis: Dict[str, Any], docs: List[str] = None) -> Tuple[str, Optional[AggregatedContext], List[Dict[str, Any]], bool, List[str]]:
+                                      analysis: Dict[str, Any], context_doc_paths: List[str] = None) -> Tuple[str, Optional[AggregatedContext], List[Dict[str, Any]], bool, List[str]]:
         """Execute single-retriever path with fallback support.
         
         Args:
             query: Query to retrieve for
             strategy: Primary retrieval strategy
             analysis: Query analysis results
-            docs: Optional list of paths to RAG content text files
+            context_doc_paths: Optional list of file paths to RAG content documents
             
         Returns:
             Tuple of (answer, aggregated_context, documents, fallback_used, sub_queries_executed)
@@ -333,10 +359,10 @@ class QueryOrchestrator:
         
         # Execute retrieval
         if query_type == "multi-hop" and sub_queries:
-            documents = self._execute_multi_hop_retrieval(sub_queries, strategy, docs=docs)
+            documents = self._execute_multi_hop_retrieval(sub_queries, strategy, context_doc_paths=context_doc_paths)
             sub_queries_executed = sub_queries
         else:
-            documents = self._retrieve_with_strategy(query, strategy, docs=docs)
+            documents = self._retrieve_with_strategy(query, strategy, context_doc_paths=context_doc_paths)
             sub_queries_executed = []
         
         # Handle fallback if insufficient documents
@@ -344,7 +370,7 @@ class QueryOrchestrator:
         if len(documents) < self.min_docs_threshold:
             logger.warning(f"Insufficient documents retrieved ({len(documents)}). Triggering fallback.")
             fallback_strategy = FALLBACK_MAP.get(strategy, STRATEGY_VECTOR_SEARCH)
-            documents = self._retrieve_with_strategy(query, fallback_strategy, docs=docs)
+            documents = self._retrieve_with_strategy(query, fallback_strategy, context_doc_paths=context_doc_paths)
             fallback_used = True
             strategy = fallback_strategy
         
@@ -366,29 +392,29 @@ class QueryOrchestrator:
         
         return answer, None, documents, fallback_used, sub_queries_executed
     
-    def _execute_multi_retriever_path(self, query: str, analysis: Dict[str, Any], docs: List[str] = None) -> Tuple[str, AggregatedContext, List[Dict[str, Any]], bool, List[str]]:
+    def _execute_multi_retriever_path(self, query: str, analysis: Dict[str, Any], context_doc_paths: List[str] = None) -> Tuple[str, AggregatedContext, List[Dict[str, Any]], bool, List[str]]:
         """Execute multi-retriever path with context aggregation.
         
         Args:
             query: Query to retrieve for
             analysis: Query analysis results
-            docs: Optional list of paths to RAG content text files
+            context_doc_paths: Optional list of file paths to RAG content documents
             
         Returns:
             Tuple of (answer, aggregated_context, documents, fallback_used, sub_queries_executed)
         """
-        aggregated_context, all_documents = self._execute_multi_retriever(query, strategies=DEFAULT_MULTI_STRATEGIES, docs=docs)
+        aggregated_context, all_documents = self._execute_multi_retriever(query, strategies=DEFAULT_MULTI_STRATEGIES, context_doc_paths=context_doc_paths)
         answer = self._synthesize_from_aggregated_context(analysis["retrieval_query"], aggregated_context)
         return answer, aggregated_context, all_documents, False, []
     
-    def _execute_multi_retriever(self, query: str, strategies: List[str] = None, top_k: int = 5, docs: List[str] = None) -> Tuple[AggregatedContext, List[Dict[str, Any]]]:
+    def _execute_multi_retriever(self, query: str, strategies: List[str] = None, top_k: int = 5, context_doc_paths: List[str] = None) -> Tuple[AggregatedContext, List[Dict[str, Any]]]:
         """Execute multiple retrievers and aggregate context.
         
         Args:
             query: Query to retrieve for
             strategies: List of strategy names to use (if None, uses primary strategies)
             top_k: Number of results per retriever
-            docs: Optional list of paths to RAG content text files
+            context_doc_paths: Optional list of file paths to RAG content documents
             
         Returns:
             Tuple of (AggregatedContext, list of documents)
@@ -411,9 +437,9 @@ class QueryOrchestrator:
             try:
                 retriever = self.retrievers[strategy]
                 # Get context blocks - this is the primary interface
-                # Pass docs parameter to retriever if provided
-                if docs:
-                    context_blocks = retriever.get_context_blocks(query, top_k=top_k, docs=docs)
+                # Pass context_doc_paths parameter to retriever if provided
+                if context_doc_paths:
+                    context_blocks = retriever.get_context_blocks(query, top_k=top_k, docs=context_doc_paths)
                 else:
                     context_blocks = retriever.get_context_blocks(query, top_k=top_k)
                 aggregated_context.add_blocks(context_blocks)
@@ -500,45 +526,8 @@ class QueryOrchestrator:
             logger.error(f"Unexpected error during synthesis: {e}", exc_info=True)
             return f"Error synthesizing answer from multiple sources: {str(e)}"
     
-    def _select_retrieval_query(self, original_query: str, rewrite_query: str, confidence: float) -> str:
-        """
-        Select whether to use original or rewritten query based on confidence.
-        If confidence is low, leverage enhance_prompt to improve the query further.
-
-        Args:
-            original_query: Original user query
-            rewrite_query: Rewritten query from analysis
-            confidence: Confidence score from analysis
-
-        Returns:
-            Query to use for retrieval
-        """
-        # If confidence is very low, use enhance_prompt to improve the query
-        if confidence < self.confidence_threshold:
-            logger.info(f"Low confidence ({confidence:.2f}). Enhancing query with PromptEnhancer.")
-            
-            # Get reflection on the original query
-            reflection = self.prompt_enhancer.reflect_prompt_openai(original_query)
-            logger.info(f"Reflection: {reflection}")
-            
-            # Use enhance_prompt to generate improved query
-            improved = self.prompt_enhancer.improve_prompt_openai_with_confidence(
-                original_query, 
-                reflection, 
-                confidence
-            )
-            
-            if improved and improved.strip() != original_query.strip():
-                logger.info(f"Enhanced query with confidence {confidence:.2f}: {improved}")
-                return improved
-            elif rewrite_query and rewrite_query.strip() != original_query.strip():
-                logger.info(f"Using analysis-provided rewrite: {rewrite_query}")
-                return rewrite_query
-        
-        logger.info(f"Confidence sufficient ({confidence:.2f}). Using original query.")
-        return original_query
-
-    def _retrieve_with_strategy(self, query: str, strategy: str, top_k: int = 5, docs: List[str] = None) -> List[Dict[str, Any]]:
+    
+    def _retrieve_with_strategy(self, query: str, strategy: str, top_k: int = 5, context_doc_paths: List[str] = None) -> List[Dict[str, Any]]:
         """
         Execute retrieval using pre-initialized retriever for the specified strategy.
 
@@ -546,7 +535,7 @@ class QueryOrchestrator:
             query: Query to retrieve for
             strategy: Retrieval strategy name
             top_k: Number of top documents to retrieve
-            docs: Optional list of paths to RAG content text files
+            context_doc_paths: Optional list of file paths to RAG content documents
 
         Returns:
             List of retrieved documents
@@ -556,16 +545,16 @@ class QueryOrchestrator:
             strategy = STRATEGY_VECTOR_SEARCH
 
         retriever = self.retrievers[strategy]
-        # Pass docs parameter to retriever if provided
-        if docs:
-            documents = retriever.retrieve(query, top_k=top_k, docs=docs)
+        # Pass context_doc_paths parameter to retriever if provided
+        if context_doc_paths:
+            documents = retriever.retrieve(query, top_k=top_k, docs=context_doc_paths)
         else:
             documents = retriever.retrieve(query, top_k=top_k)
         logger.info(f"Retrieved {len(documents)} documents using {strategy}")
         return documents
 
     def _execute_multi_hop_retrieval(self, sub_queries: List[str], strategy: str,
-                                      top_k: int = 3, docs: List[str] = None) -> List[Dict[str, Any]]:
+                                      top_k: int = 3, context_doc_paths: List[str] = None) -> List[Dict[str, Any]]:
         """
         Execute retrieval for multi-hop queries by retrieving for each sub-query.
 
@@ -573,7 +562,7 @@ class QueryOrchestrator:
             sub_queries: List of sub-queries
             strategy: Retrieval strategy name
             top_k: Number of documents per sub-query
-            docs: Optional list of paths to RAG content text files
+            context_doc_paths: Optional list of file paths to RAG content documents
 
         Returns:
             Aggregated list of documents
@@ -583,8 +572,8 @@ class QueryOrchestrator:
 
         for i, sub_query in enumerate(sub_queries, 1):
             logger.info(f"Executing sub-query {i}/{len(sub_queries)}: {sub_query}")
-            sub_docs = self._retrieve_with_strategy(sub_query, strategy, top_k=top_k, docs=docs)
-            for doc in docs:
+            sub_docs = self._retrieve_with_strategy(sub_query, strategy, top_k=top_k, context_doc_paths=context_doc_paths)
+            for doc in sub_docs:
                 doc_id = doc.get("id")
                 if doc_id not in seen_ids:
                     all_documents.append(doc)
@@ -596,8 +585,194 @@ class QueryOrchestrator:
 
 
 
+def create_argument_parser() -> argparse.ArgumentParser:
+    """Create and return command-line argument parser."""
+    parser = argparse.ArgumentParser(
+        description="Adaptive RAG - Intelligent Retrieval-Augmented Generation System",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic query
+  python adaptive_rag.py --query "What is artificial intelligence?"
+  
+  # With context documents
+  python adaptive_rag.py --query "Best AI companies" \\
+                         --context-docs docs/companies.txt docs/ai_trends.txt
+  
+  # With multiple retrievers
+  python adaptive_rag.py --query "What is machine learning?" \\
+                         --context-docs data/ml.txt \\
+                         --multi-retriever
+  
+  # Query from file
+  python adaptive_rag.py --query-file query.txt --context-docs data/docs.txt
+        """
+    )
+    
+    # Query arguments (required: either --query or --query-file)
+    query_group = parser.add_mutually_exclusive_group(required=True)
+    query_group.add_argument(
+        '--query', '-q',
+        type=str,
+        help='User query string',
+        metavar='QUERY'
+    )
+    query_group.add_argument(
+        '--query-file', '-qf',
+        type=str,
+        help='Path to file containing the query',
+        metavar='FILE'
+    )
+    
+    # Context documents (optional)
+    parser.add_argument(
+        '--context-docs', '-c',
+        nargs='+',
+        help='Paths to context document files (space-separated)',
+        metavar='FILE'
+    )
+    
+    # Retrieval mode
+    parser.add_argument(
+        '--multi-retriever', '-m',
+        action='store_true',
+        help='Use multiple retrievers (vector, graph, web) and aggregate contexts'
+    )
+    
+    # Output format
+    parser.add_argument(
+        '--output-format', '-o',
+        choices=['json', 'text'],
+        default='text',
+        help='Output format (default: text)'
+    )
+    
+    # Verbose logging
+    parser.add_argument(
+        '--verbose', '-v',
+        action='store_true',
+        help='Enable verbose logging'
+    )
+    
+    return parser
+
+
+def get_user_query(args: argparse.Namespace) -> Optional[str]:
+    """
+    Extract user query from CLI arguments.
+    
+    Args:
+        args: Parsed command-line arguments
+        
+    Returns:
+        Query string or None if not found
+    """
+    if args.query:
+        return args.query
+    
+    if args.query_file:
+        try:
+            query_file_path = Path(args.query_file)
+            if not query_file_path.exists():
+                logger.error(f"Query file not found: {args.query_file}")
+                return None
+            with open(query_file_path, 'r') as f:
+                return f.read().strip()
+        except Exception as e:
+            logger.error(f"Error reading query file '{args.query_file}': {str(e)}")
+            return None
+    
+    return None
+
+
+def get_context_doc_paths(args: argparse.Namespace) -> Optional[List[str]]:
+    """
+    Extract and validate context document paths from CLI arguments.
+    
+    Args:
+        args: Parsed command-line arguments
+        
+    Returns:
+        List of validated file paths or None if not provided
+    """
+    if not args.context_docs:
+        return None
+    
+    validated_paths = []
+    for doc_path in args.context_docs:
+        doc_file_path = Path(doc_path)
+        if not doc_file_path.exists():
+            logger.warning(f"Context document not found: {doc_path}")
+        else:
+            validated_paths.append(doc_path)
+    
+    return validated_paths if validated_paths else None
+
+
+def format_output(result: Dict[str, Any], output_format: str) -> str:
+    """
+    Format the result based on output format preference.
+    
+    Args:
+        result: Result dictionary from orchestrate()
+        output_format: Output format ('json' or 'text')
+        
+    Returns:
+        Formatted output string
+    """
+    if output_format == 'json':
+        return json.dumps(result, indent=2, ensure_ascii=False)
+    
+    # Text format (default)
+    output = []
+    output.append("\n" + "=" * 80)
+    output.append("ADAPTIVE RAG RESPONSE")
+    output.append("=" * 80)
+    
+    if result.get('error'):
+        output.append(f"\n❌ ERROR: {result.get('error_message')}")
+        output.append(f"Error Type: {result.get('error_type')}")
+    else:
+        output.append(f"\n📝 Query: {result.get('query')}")
+        output.append(f"\n💡 Answer:\n{result.get('answer')}")
+        
+        metadata = result.get('metadata', {})
+        output.append(f"\n📊 Metadata:")
+        output.append(f"  - Strategy: {result.get('retrieval_strategy')}")
+        output.append(f"  - Confidence: {metadata.get('confidence_score'):.2f}" if metadata.get('confidence_score') else "  - Confidence: N/A")
+        output.append(f"  - Documents: {metadata.get('documents_count')}")
+        output.append(f"  - Query Type: {metadata.get('query_type')}")
+        output.append(f"  - Multi-Retriever: {metadata.get('multi_retriever_used')}")
+    
+    output.append("=" * 80)
+    return "\n".join(output)
+
+
 def main():
-    """Demonstrate Query Orchestrator with Vector Search and Graph Search integration."""
+    """Main entry point - initializes RAG with CLI arguments and executes orchestration."""
+    # Parse command-line arguments
+    parser = create_argument_parser()
+    args = parser.parse_args()
+    
+    # Setup logging verbosity
+    if args.verbose:
+        logging.getLogger().setLevel(logging.DEBUG)
+    
+    # Extract user query from CLI args
+    user_query = get_user_query(args)
+    if not user_query:
+        logger.error("No query provided. Use --query or --query-file")
+        sys.exit(1)
+    
+    # Extract context document paths from CLI args
+    context_document_paths = get_context_doc_paths(args)
+    
+    # Log input parameters
+    logger.info(f"User Query: {user_query}")
+    if context_document_paths:
+        logger.info(f"Context Documents: {context_document_paths}")
+    logger.info(f"Multi-Retriever Mode: {args.multi_retriever}")
+    
     # Initialize dependencies once
     llm = config.get_llm()
     prompt_enhancer = PromptEnhancer(llm=llm)
@@ -615,22 +790,28 @@ def main():
         env_file=".env"
     )
 
-    # Sample raw user query
-    query = "Which companies investing in AI are hiring machine learning engineers?"
-
-    # Execute orchestration with single retriever strategy
-    print("\n" + "=" * 80)
-    print("SINGLE RETRIEVER MODE")
-    print("=" * 80)
-    result = orchestrator.orchestrate(query, use_multiple_retrievers=False)
-    print(json.dumps(result, indent=2, ensure_ascii=False))
-
-    # Execute orchestration with multiple retrievers and aggregated context
-    print("\n" + "=" * 80)
-    print("MULTI-RETRIEVER MODE (AGGREGATED CONTEXT)")
-    print("=" * 80)
-    result_multi = orchestrator.orchestrate(query, use_multiple_retrievers=True)
-    print(json.dumps(result_multi, indent=2, ensure_ascii=False))
+    # Execute orchestration with user's choice of retrieval mode
+    if args.multi_retriever:
+        print("\n" + "=" * 80)
+        print("MULTI-RETRIEVER MODE (AGGREGATED CONTEXT)")
+        print("=" * 80)
+    else:
+        print("\n" + "=" * 80)
+        print("SINGLE RETRIEVER MODE")
+        print("=" * 80)
+    
+    result = orchestrator.orchestrate(
+        query=user_query,
+        context_doc_paths=context_document_paths,
+        use_multiple_retrievers=args.multi_retriever
+    )
+    
+    # Format and print output
+    output = format_output(result, args.output_format)
+    print(output)
+    
+    # Exit with appropriate code
+    sys.exit(0 if not result.get('error') else 1)
 
 
 if __name__ == "__main__":

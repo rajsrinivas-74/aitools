@@ -10,7 +10,7 @@ Design Pattern: Factory Pattern
 """
 
 import logging
-from typing import Dict, Optional
+from typing import Dict
 from abc import ABC, abstractmethod
 
 logger = logging.getLogger(__name__)

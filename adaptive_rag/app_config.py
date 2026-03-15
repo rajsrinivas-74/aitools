@@ -38,8 +38,14 @@ class AppConfig:
         else:
             load_dotenv()  # Load from system environment
         
-        # Core configuration
-        self.model = os.getenv("MODEL", "gpt-3.5-turbo")
+        # Core configuration - LLM Models
+        # Default models for different components (can be overridden via environment)
+        self.llm_model = os.getenv("LLM_MODEL", "gpt-5")
+        self.embedding_model = os.getenv("EMBEDDING_MODEL", "text-embedding-3-small")
+        
+        # Deprecated: Use self.llm_model instead
+        self.model = self.llm_model
+        
         self.openai_api_key = os.getenv("OPENAI_API_KEY", "")
         
         # RAG configuration
@@ -67,7 +73,15 @@ class AppConfig:
         )
         
         self._initialized = True
-        logger.info(f"AppConfig initialized with model: {self.model}")
+        logger.info(f"AppConfig initialized with model: {self.llm_model}")
+    
+    def get_default_llm_model(self) -> str:
+        """Get the default LLM model from configuration."""
+        return self.llm_model
+    
+    def get_default_embedding_model(self) -> str:
+        """Get the default embedding model from configuration."""
+        return self.embedding_model
     
     def get_llm(self):
         """
@@ -81,12 +95,12 @@ class AppConfig:
                 from langchain_openai import ChatOpenAI
                 
                 AppConfig._llm_instance = ChatOpenAI(
-                    model_name=self.model,
+                    model_name=self.llm_model,
                     temperature=self.generation_temperature,
                     max_tokens=self.max_tokens,
                     openai_api_key=self.openai_api_key,
                 )
-                logger.info(f"LLM instance created: {self.model}")
+                logger.info(f"LLM instance created: {self.llm_model}")
             except ImportError:
                 logger.error("langchain_openai not installed. Install with: pip install langchain-openai")
                 raise RuntimeError("LangChain OpenAI is not installed")

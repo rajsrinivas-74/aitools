@@ -48,7 +48,12 @@ class PromptEnhancer:
         except Exception as e:
             raise RuntimeError(f"LangChain ChatOpenAI not available: {e}")
 
-    def langchain_chat(self, user_prompt: str, system: str | None = None, model: str = "gpt-3.5-turbo") -> str:
+    def langchain_chat(self, user_prompt: str, system: str | None = None, model: str = None) -> str:
+        # Use default model from config if not provided
+        if model is None:
+            config = get_config()
+            model = config.get_default_llm_model()
+        
         prompt = (system + "\n\n" + user_prompt) if system else user_prompt
         try:
             llm = self.init_chat_model(model, temperature=0.2)

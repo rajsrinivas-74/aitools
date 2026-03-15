@@ -35,11 +35,12 @@ class QueryAnalyzer:
             "- entities: list of important entities, organizations, technologies, or concepts\n"
             "- domain: the main domain (e.g., technology, finance, legal, healthcare, general knowledge)\n"
             "- complexity: one of [simple, moderate, complex]\n"
-            "- recommended_retrieval_strategy: one of [vector search, hybrid search, graph retrieval, SQL retrieval, web search, multi-step retrieval]\n"
+            "- recommended_retrieval_strategy: one of [vector search, hybrid search, graph retrieval, web search, multi-step retrieval]\n"
             "- rewrite_query: improved version of the query if needed (else repeat original)\n"
             "- sub_queries: list of sub-queries if multi-hop, else []\n"
             "- confidence_score: float between 0 and 1\n"
-            "Analyze carefully and be concise. Only output valid JSON.\n"
+            "Analyze carefully and be concise. Only output valid JSON.\n" \
+            "Please do a reflection to validate the JSON data." \
             "Query: {query}"
         )
 

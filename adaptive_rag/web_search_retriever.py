@@ -6,7 +6,7 @@ Follows the Adaptive RAG architecture with dependency injection and centralized 
 """
 
 import logging
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any
 
 from app_config import get_config
 from rag_utils import generate_response_from_contexts, BaseRetriever, ContextBlock
@@ -279,12 +279,12 @@ class WebSearchRetriever(BaseRetriever):
                 }
             })
         
-        # Generate response using common function
+        # Generate response using common function (uses config default if llm_model is None)
         try:
             response = generate_response_from_contexts(
                 question=query,
                 context_blocks=context_blocks,
-                llm_model="gpt-3.5-turbo",
+                llm_model=None,
                 include_source_attribution=True
             )
             return response
@@ -310,7 +310,7 @@ class WebSearchLLMPipeline:
             tavily_api_key: Tavily API key
         """
         config = get_config()
-        self.llm = llm or config.get_llm_generator(temperature=0.7)
+        self.llm = llm or config.get_llm()
         self.web_retriever = WebSearchRetriever(tavily_api_key=tavily_api_key)
         logger.info("WebSearchLLMPipeline initialized")
 
@@ -327,26 +327,57 @@ class WebSearchLLMPipeline:
         """
         logger.info(f"Processing query: {query}")
         
-        # Use the common generate_response method from WebSearchRetriever
-        response_data = self.web_retriever.generate_response(query, max_results=max_results, llm_model=self.get_llm_model())
-        
-        return {
-            "query": query,
-            "web_results": response_data.get("search_results", []),
-            "context": self._format_blocks_to_context(response_data.get("context_blocks", [])),
-            "answer": response_data.get("response", ""),
-            "sources": response_data.get("sources_used", []),
-            "error": response_data.get("error")
-        }
+        try:
+            # Perform web search to get context
+            results = self.web_retriever.retrieve(query, top_k=max_results)
+            
+            # Format results for context
+            context_blocks = []
+            for i, result in enumerate(results):
+                content = f"Title: {result.get('title', '')}\nURL: {result.get('url', '')}\nContent: {result.get('content', '')}"
+                context_blocks.append({
+                    "content": content,
+                    "source": "web_search",
+                    "score": result.get("score", 0.0),
+                    "metadata": {
+                        "title": result.get("title", ""),
+                        "url": result.get("url", ""),
+                        "retrieval_method": "tavily_web_search"
+                    }
+                })
+            
+            # Generate answer using LLM
+            answer = self._generate_answer(query, self._format_blocks_to_context(context_blocks))
+            
+            return {
+                "query": query,
+                "web_results": results,
+                "context": self._format_blocks_to_context(context_blocks),
+                "answer": answer,
+                "sources": [r.get("url", "") for r in results if r.get("url")],
+                "error": None
+            }
+        except Exception as e:
+            logger.error(f"Process query failed: {e}")
+            return {
+                "query": query,
+                "web_results": [],
+                "context": "",
+                "answer": "",
+                "sources": [],
+                "error": str(e)
+            }
     
     def get_llm_model(self) -> str:
-        """Get the LLM model name from the LLM instance."""
+        """Get the LLM model name from the LLM instance or config."""
         # Try to get model name from LLM
         if hasattr(self.llm, "model_name"):
             return self.llm.model_name
         elif hasattr(self.llm, "model"):
             return self.llm.model
-        return "gpt-3.5-turbo"
+        # Fall back to config default
+        config = get_config()
+        return config.get_default_llm_model()
     
     def _format_blocks_to_context(self, blocks: List[dict]) -> str:
         """Format context blocks to readable string."""
@@ -406,40 +437,57 @@ def main():
     print("WEB SEARCH + LLM PIPELINE DEMO")
     print("="*80 + "\n")
     
-    # Initialize system
-    system = initialize_rag_system()
+    try:
+        # Initialize system
+        system = initialize_rag_system()
+        
+        # Create pipeline with injected LLM (use 'llm' key, not 'llm_gen')
+        pipeline = WebSearchLLMPipeline(llm=system["llm"])
+        
+        # Example query
+        query = "What are the latest developments in artificial intelligence in 2026?"
+        
+        print(f"Query: {query}\n")
+        
+        # Process query
+        result = pipeline.process_query(query, max_results=5)
+        
+        # Display results
+        print("\n" + "-"*80)
+        print("WEB SEARCH RESULTS")
+        print("-"*80)
+        for i, result_item in enumerate(result["web_results"], 1):
+            print(f"[{i}] {result_item['title']}")
+            print(f"    URL: {result_item['url']}")
+            print(f"    Snippet: {result_item['content'][:200]}...")
+            print()
+        
+        print("-"*80)
+        print("FORMATTED CONTEXT")
+        print("-"*80)
+        print(result["context"])
+        
+        print("-"*80)
+        print("LLM ANSWER")
+        print("-"*80)
+        print(result["answer"])
     
-    # Create pipeline with injected dependencies
-    pipeline = WebSearchLLMPipeline(llm=system["llm_gen"])
+    except KeyError as e:
+        print(f"✗ Configuration error: Missing key {e}")
+        print("  Make sure rag_init.initialize_rag_system() returns all required keys")
+        return 1
+    except RuntimeError as e:
+        print(f"✗ Runtime error: {e}")
+        return 1
+    except Exception as e:
+        print(f"✗ Unexpected error: {e}")
+        import traceback
+        traceback.print_exc()
+        return 1
     
-    # Example query
-    query = "What are the latest developments in artificial intelligence in 2026?"
-    
-    print(f"Query: {query}\n")
-    
-    # Process query
-    result = pipeline.process_query(query, max_results=5)
-    
-    # Display results
-    print("\n" + "-"*80)
-    print("WEB SEARCH RESULTS")
-    print("-"*80)
-    for i, result_item in enumerate(result["web_results"], 1):
-        print(f"[{i}] {result_item['title']}")
-        print(f"    URL: {result_item['url']}")
-        print(f"    Snippet: {result_item['content'][:200]}...")
-        print()
-    
-    print("-"*80)
-    print("FORMATTED CONTEXT")
-    print("-"*80)
-    print(result["context"])
-    
-    print("-"*80)
-    print("LLM ANSWER")
-    print("-"*80)
-    print(result["answer"])
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    sys.exit(main())
